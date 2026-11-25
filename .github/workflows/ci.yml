@@ -1,0 +1,17 @@
+name: Verify
+on: [push, pull_request]
+jobs:
+  verify:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p snapdock
+        if: runner.os == 'Windows'
+      - run: cargo build -p snapdock
+        if: runner.os == 'Windows'
+      - run: cargo test --locked --manifest-path src/server/Cargo.toml
+      - run: cargo build --locked --manifest-path src/server/Cargo.toml

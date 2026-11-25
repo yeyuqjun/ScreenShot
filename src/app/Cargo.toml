@@ -1,0 +1,56 @@
+[package]
+name = "snapdock"
+version = "1.0.0"
+edition = "2024"
+description = "SnapDock - Pure-Rust Windows screenshot, annotation, OCR, translation, and desktop pin utility"
+
+[dependencies]
+egui = "0.31"
+egui-winit = { version = "0.31", default-features = false, features = ["clipboard", "links", "x11"] }
+egui-wgpu = { version = "0.31", default-features = false, features = ["winit"] }
+wgpu = { version = "24", features = ["dx12", "wgsl"] }
+winit = "0.30"
+raw-window-handle = "0.6"
+pollster = "0.4"
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+tray-icon = "0.25"
+muda = "0.20"
+global-hotkey = "0.8"
+rfd = "0.17"
+auto-launch = "0.6"
+dirs = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif"] }
+arboard = "3"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+scrypt = { version = "0.11", features = ["std"] }
+aes-gcm = "0.10"
+x509-cert = { version = "0.2", features = ["pem"] }
+der = "0.7"
+url = "2"
+rapidocr-core = { version = "0.3.1", default-features = false, features = ["load-dynamic"] }
+ort = { version = "2.0.0-rc.15", default-features = false, features = ["load-dynamic"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

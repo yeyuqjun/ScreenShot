@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = ["src/app"]
+# Keep the sync server as an independent build (with its own Cargo.lock and profile; see src/server).
+exclude = ["src/server"]

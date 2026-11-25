@@ -1,0 +1,149 @@
+{
+  "general": { "language": "en", "theme": "light", "accent": "mint", "textColor": "auto", "launchAtLogin": false, "closeToTray": true },
+  "capture": {
+    "detectWindows": true,
+    "detectControls": false,
+    "magnifier": true,
+    "delay": 0,
+    "copyOnCapture": true,
+    "historyLimit": 100
+  },
+  "shortcuts": {
+    "capture": "Alt+Shift+A",
+    "pin": "Alt+Shift+P",
+    "long": "Alt+Shift+L",
+    "gif": "Alt+Shift+G",
+    "togglePins": "Alt+Shift+H",
+    "settings": "Alt+Shift+S"
+  },
+  "pin": {
+    "opacity": 100,
+    "scale": 100,
+    "border": false,
+    "doubleClickClose": false
+  },
+  "record": { "fps": 8, "maxSeconds": 15, "maxWidth": 1280 },
+  "long": {
+    "maxFrames": 30,
+    "intervalMs": 250,
+    "stickyTop": 0,
+    "stickyBottom": 0
+  },
+  "annotations": {
+    "rect": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "line": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "ellipse": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "arrow": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "pen": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "text": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "watermark": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 28,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 30
+    },
+    "number": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "mosaic": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    },
+    "highlighter": {
+      "color": "#f6ca45",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 30
+    },
+    "eraser": {
+      "color": "#ef6656",
+      "width": 3,
+      "fontSize": 24,
+      "fontFamily": "Microsoft YaHei",
+      "opacity": 100
+    }
+  },
+  "storage": {
+    "autoSave": false,
+    "directory": "",
+    "format": "png",
+    "quality": 90
+  },
+  "service": {
+    "url": "https://127.0.0.1:8899",
+    "username": "",
+    "caPem": "",
+    "autoSync": false
+  },
+  "providers": {
+    "ocr": {
+      "mode": "local",
+      "local": { "modelDir": "", "model": "", "mirror": "modelscope-cn", "useCls": false },
+      "api": { "url": "", "key": "", "responsePath": "text" },
+      "ai": {
+        "url": "",
+        "key": "",
+        "model": "",
+        "prompt": "Accurately recognize all text in the image, preserving paragraphs and line breaks. Return only the recognized text."
+      }
+    },
+    "translation": {
+      "mode": "local",
+      "source": "auto",
+      "target": "en",
+      "local": { "modelDir": "", "mirror": "hf-mirror" },
+      "api": { "url": "", "key": "", "responsePath": "translation" },
+      "ai": {
+        "url": "",
+        "key": "",
+        "model": "",
+        "prompt": "Translate the following text into {target}. Return only the translation and preserve the original formatting."
+      }
+    }
+  }
+}
