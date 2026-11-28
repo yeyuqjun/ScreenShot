@@ -6,6 +6,7 @@
 //! - Automatic direct and English-pivot routing (e.g. `ja-en` + `en-zh` enables offline Japanese -> Chinese).
 
 use crate::i18n;
+use crate::model_files::{self, FileStamp, PendingFile};
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::{Session, SessionInputValue, SessionInputs};
 use ort::value::{DynValue, Tensor};
@@ -1100,7 +1101,7 @@ impl TranslationPairEntry {
             .steps
             .iter()
             .filter(|s| is_pack_complete(&pack_dir_in(storage_dir, s.pack.id), s.pack))
-            .map(|s| pack_disk_bytes(&pack_dir_in(storage_dir, s.pack.id), s.pack))
+            .map(|s| inspect_pack(pack_dir_in(storage_dir, s.pack.id), s.pack).disk_bytes)
             .sum()
     }
 }
@@ -1309,6 +1310,9 @@ pub struct PackInstallState {
     pub installed: bool,
     pub dir: PathBuf,
     pub disk_bytes: u64,
+    pub missing: Vec<&'static str>,
+    pub invalid: Vec<&'static str>,
+    pub has_local_files: bool,
 }
 
 /// Overall local translation engine status for the Settings UI.
@@ -1370,25 +1374,66 @@ pub fn pack_dir_in(base_dir: &Path, pack_id: &str) -> PathBuf {
     base_dir.join(pack_id)
 }
 
-/// Check whether `dir` contains all required non-empty files for `spec`.
-pub fn is_pack_complete(dir: &Path, spec: &TranslationPackSpec) -> bool {
-    if !dir.is_dir() {
-        return false;
+fn validate_pack_file(path: &Path, name: &str) -> bool {
+    match name {
+        "config.json" => std::fs::read(path).ok().is_some_and(|bytes| {
+            let Ok(config) = serde_json::from_slice::<MarianConfigJson>(&bytes) else {
+                return false;
+            };
+            config.model_type == "marian"
+                && config.decoder_layers > 0
+                && config.decoder_attention_heads > 0
+                && config.d_model > 0
+                && config.d_model % config.decoder_attention_heads == 0
+                && config.max_position_embeddings > 0
+        }),
+        "tokenizer.json" => std::fs::read(path).ok().is_some_and(|bytes| {
+            serde_json::from_slice::<HfTokenizerJson>(&bytes)
+                .is_ok_and(|tokenizer| !tokenizer.model.vocab.is_empty())
+        }),
+        _ => model_files::has_onnx_envelope(path),
     }
-    spec.files.iter().all(|f| {
-        dir.join(f.local_name)
-            .metadata()
-            .is_ok_and(|m| m.is_file() && m.len() > 0)
-    })
 }
 
-fn pack_disk_bytes(dir: &Path, spec: &TranslationPackSpec) -> u64 {
+fn check_pack_file(path: &Path, name: &'static str) -> Option<FileStamp> {
+    model_files::checked_file(path, name, || validate_pack_file(path, name))
+}
+
+/// Check the required translation config, tokenizer, and ONNX files.
+pub fn is_pack_complete(dir: &Path, spec: &TranslationPackSpec) -> bool {
     spec.files
         .iter()
-        .filter_map(|f| dir.join(f.local_name).metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+        .all(|f| check_pack_file(&dir.join(f.local_name), f.local_name).is_some())
+}
+
+fn inspect_pack(dir: PathBuf, spec: &'static TranslationPackSpec) -> PackInstallState {
+    let mut missing = Vec::new();
+    let mut invalid = Vec::new();
+    let mut has_local_files = false;
+    let mut disk_bytes = 0;
+    for f in spec.files {
+        let path = dir.join(f.local_name);
+        has_local_files |= model_files::has_local_file(&path);
+        if let Ok(metadata) = path.metadata() {
+            if metadata.is_file() {
+                disk_bytes += metadata.len();
+            }
+            if check_pack_file(&path, f.local_name).is_none() {
+                invalid.push(f.local_name);
+            }
+        } else {
+            missing.push(f.local_name);
+        }
+    }
+    PackInstallState {
+        spec,
+        installed: missing.is_empty() && invalid.is_empty(),
+        dir,
+        disk_bytes,
+        missing,
+        invalid,
+        has_local_files,
+    }
 }
 
 /// Inspect local translation runtime and installation status for all packs.
@@ -1402,22 +1447,9 @@ pub fn inspect_status(data_dir: &Path, settings: &Value) -> LocalTranslateStatus
     let mut packs = Vec::with_capacity(PACK_CATALOG.len());
     let mut installed_count = 0usize;
     for spec in PACK_CATALOG {
-        let dir = pack_dir_in(&storage_dir, spec.id);
-        let installed = is_pack_complete(&dir, spec);
-        let disk_bytes = if installed {
-            pack_disk_bytes(&dir, spec)
-        } else {
-            0
-        };
-        if installed {
-            installed_count += 1;
-        }
-        packs.push(PackInstallState {
-            spec,
-            installed,
-            dir,
-            disk_bytes,
-        });
+        let pack = inspect_pack(pack_dir_in(&storage_dir, spec.id), spec);
+        installed_count += usize::from(pack.installed);
+        packs.push(pack);
     }
 
     LocalTranslateStatus {
@@ -1488,17 +1520,12 @@ where
 
     for (idx, file) in spec.files.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            cleanup_part_files(&target_dir);
             return Err(i18n::t("Download cancelled").into());
         }
 
         let dest = target_dir.join(file.local_name);
-        if dest.metadata().is_ok_and(|m| m.is_file() && m.len() > 0) {
-            completed_bytes = completed_bytes.saturating_add(
-                dest.metadata()
-                    .map(|m| m.len())
-                    .unwrap_or(file.approx_bytes),
-            );
+        if let Some(stamp) = check_pack_file(&dest, file.local_name) {
+            completed_bytes = completed_bytes.saturating_add(stamp.len);
             on_progress(PackDownloadProgress {
                 pack_id: spec.id.to_string(),
                 file_index: idx + 1,
@@ -1528,18 +1555,18 @@ where
             ));
         }
 
-        let remote_len = resp.content_length().unwrap_or(file.approx_bytes);
+        let content_len = resp.content_length();
+        let remote_len = content_len.unwrap_or(file.approx_bytes);
         let remaining_est: u64 = spec.files[idx + 1..].iter().map(|f| f.approx_bytes).sum();
         let effective_total = completed_bytes
             .saturating_add(remote_len)
             .saturating_add(remaining_est);
 
-        let part_path = target_dir.join(format!("{}.part", file.local_name));
-        let mut out = std::fs::File::create(&part_path).map_err(|e| {
+        let (pending, mut out) = PendingFile::create(&dest).map_err(|e| {
             i18n::tf(
                 "Unable to write temporary file {path}: {err}",
                 &[
-                    ("path", &part_path.display().to_string()),
+                    ("path", &model_files::part_path(&dest).display().to_string()),
                     ("err", &e.to_string()),
                 ],
             )
@@ -1557,9 +1584,6 @@ where
             )
         })? {
             if cancel.load(Ordering::Relaxed) {
-                drop(out);
-                let _ = std::fs::remove_file(&part_path);
-                cleanup_part_files(&target_dir);
                 return Err(i18n::t("Download cancelled").into());
             }
             out.write_all(&chunk).map_err(|e| {
@@ -1592,17 +1616,19 @@ where
         })?;
         drop(out);
 
-        if file_downloaded == 0 {
-            let _ = std::fs::remove_file(&part_path);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(i18n::t("Download cancelled").into());
+        }
+        if file_downloaded == 0
+            || content_len.is_some_and(|expected| expected != file_downloaded)
+            || !validate_pack_file(pending.path(), file.local_name)
+        {
             return Err(i18n::tf(
-                "Downloaded file {file} is empty; please try again",
+                "Model file failed validation: {file}",
                 &[("file", file.local_name)],
             ));
         }
-        if dest.exists() {
-            let _ = std::fs::remove_file(&dest);
-        }
-        std::fs::rename(&part_path, &dest).map_err(|e| {
+        pending.install(&dest).map_err(|e| {
             i18n::tf(
                 "Failed to save file {file}: {err}",
                 &[("file", file.local_name), ("err", &e.to_string())],
@@ -1623,48 +1649,33 @@ where
     Ok(target_dir)
 }
 
-fn cleanup_part_files(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("part") {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-}
-
-/// Delete a downloaded language pack and evict any cached ONNX session.
+/// Delete the selected language pack files and evict its ONNX session.
 pub fn remove_pack(pack_id: &str, base_dir: &Path) -> Result<(), String> {
     let spec = find_pack_spec(pack_id)
         .ok_or_else(|| i18n::tf("Language pack not found: {id}", &[("id", pack_id)]))?;
-    evict_cached_pack(spec.id);
-    let dir = pack_dir_in(base_dir, spec.id);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| {
-            i18n::tf(
-                "Failed to remove language pack directory ({path}): {err}",
-                &[
-                    ("path", &dir.display().to_string()),
-                    ("err", &e.to_string()),
-                ],
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Evict the cached translator session if it matches `pack_id`.
-pub fn evict_cached_pack(pack_id: &str) {
-    let mut guard = ENGINE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = ENGINE_CACHE.lock().unwrap_or_else(|err| err.into_inner());
     if guard
         .as_ref()
-        .is_some_and(|cached| cached.key.pack_id == pack_id)
+        .is_some_and(|cached| cached.key.pack_id == spec.id)
     {
         *guard = None;
     }
+    let dir = pack_dir_in(base_dir, spec.id);
+    let remove = || -> std::io::Result<()> {
+        for file in spec.files {
+            model_files::remove_model_file(&dir.join(file.local_name))?;
+        }
+        model_files::remove_empty_dir(&dir)
+    };
+    remove().map_err(|e| {
+        i18n::tf(
+            "Failed to delete model files ({path}): {err}",
+            &[
+                ("path", &dir.display().to_string()),
+                ("err", &e.to_string()),
+            ],
+        )
+    })
 }
 
 // ============================================================================
@@ -2114,7 +2125,7 @@ pub fn resolve_translation_route(
     let joined = names.join(", ");
     if plan.steps.len() > 1 {
         Err(i18n::tf(
-            "Offline translation ({src} -> {tgt}) bridges via English and requires missing pack(s): {packs}. Download them in Settings -> Text & Translation -> Translation",
+            "Offline translation ({src} -> {tgt}) requires these packs to bridge via English: {packs}. Download or repair them in Settings -> Text & Translation -> Translation",
             &[
                 ("src", lang_display_name(source_code)),
                 ("tgt", lang_display_name(target_code)),
@@ -2123,7 +2134,7 @@ pub fn resolve_translation_route(
         ))
     } else {
         Err(i18n::tf(
-            "Language pack not downloaded: {packs}. Download it in Settings -> Text & Translation -> Translation",
+            "Language pack unavailable: {packs}. Download or repair it in Settings -> Text & Translation -> Translation",
             &[("packs", &joined)],
         ))
     }
@@ -2157,6 +2168,7 @@ struct HfAddedToken {
 
 #[derive(Debug, Deserialize)]
 struct MarianConfigJson {
+    model_type: String,
     #[serde(default = "default_decoder_layers")]
     decoder_layers: usize,
     #[serde(default = "default_decoder_heads")]
@@ -2513,6 +2525,7 @@ struct TranslatorKey {
     dll_path: PathBuf,
     pack_dir: PathBuf,
     pack_id: &'static str,
+    files: Vec<FileStamp>,
     intra_threads: usize,
 }
 
@@ -2553,24 +2566,29 @@ fn load_or_get_translator<'a>(
     pack_dir: &Path,
     spec: &'static TranslationPackSpec,
 ) -> Result<&'a mut CachedTranslator, String> {
+    let files = spec
+        .files
+        .iter()
+        .map(|file| {
+            check_pack_file(&pack_dir.join(file.local_name), file.local_name).ok_or_else(|| {
+                i18n::tf(
+                    "Model file failed validation: {file}",
+                    &[("file", file.local_name)],
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let key = TranslatorKey {
         dll_path: dll_path.to_path_buf(),
         pack_dir: pack_dir.to_path_buf(),
         pack_id: spec.id,
+        files,
         intra_threads: default_intra_threads(),
     };
 
     let needs_rebuild = guard.as_ref().is_none_or(|c| c.key != key);
     if needs_rebuild {
-        let runtime = OcrRuntime::load_from(&key.dll_path).map_err(|e| {
-            i18n::tf(
-                "Unable to load ONNX Runtime ({path}): {err}",
-                &[
-                    ("path", &key.dll_path.display().to_string()),
-                    ("err", &e.to_string()),
-                ],
-            )
-        })?;
+        let runtime = crate::ocr::load_shared_runtime(&key.dll_path)?;
         let env = runtime.environment();
 
         let cfg_bytes = std::fs::read(pack_dir.join("config.json")).map_err(|e| {
@@ -3082,7 +3100,13 @@ mod tests {
             let dir = pack_dir_in(&tmp, pack_id);
             std::fs::create_dir_all(&dir).unwrap();
             for f in spec.files {
-                std::fs::write(dir.join(f.local_name), b"stub").unwrap();
+                let contents: &[u8] = match f.local_name {
+                    "config.json" => br#"{"model_type":"marian"}"#,
+                    "tokenizer.json" => br#"{"model":{"vocab":[["<unk>",0]]}}"#,
+                    // ModelProto with ir_version and a nonempty graph field.
+                    _ => &[8, 9, 58, 3, 18, 1, b'g'],
+                };
+                std::fs::write(dir.join(f.local_name), contents).unwrap();
             }
         }
         let route = resolve_translation_route("ja", "zh", &tmp).unwrap();
@@ -3096,7 +3120,13 @@ mod tests {
             let dir = pack_dir_in(&tmp, pack_id);
             std::fs::create_dir_all(&dir).unwrap();
             for f in spec.files {
-                std::fs::write(dir.join(f.local_name), b"stub").unwrap();
+                let contents: &[u8] = match f.local_name {
+                    "config.json" => br#"{"model_type":"marian"}"#,
+                    "tokenizer.json" => br#"{"model":{"vocab":[["<unk>",0]]}}"#,
+                    // ModelProto with ir_version and a nonempty graph field.
+                    _ => &[8, 9, 58, 3, 18, 1, b'g'],
+                };
+                std::fs::write(dir.join(f.local_name), contents).unwrap();
             }
         }
         for src in LANGUAGES {
@@ -3115,6 +3145,26 @@ mod tests {
         assert_eq!(zh_ko.len(), 2);
         assert_eq!(zh_ko[1].pack.id, "en-mul");
         assert!(zh_ko[1].prefix_candidates.contains(&">>kor<<"));
+
+        let dir = pack_dir_in(&tmp, "en-zh");
+        let spec = find_pack_spec("en-zh").unwrap();
+        let encoder = dir.join("encoder_model_quantized.onnx");
+        std::fs::write(&encoder, [8, 9, 58, 3, 18]).unwrap();
+        std::fs::remove_file(dir.join("tokenizer.json")).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"unrelated").unwrap();
+        let state = inspect_pack(dir.clone(), spec);
+        assert!(!state.installed && state.has_local_files);
+        assert_eq!(state.invalid, ["encoder_model_quantized.onnx"]);
+        assert_eq!(state.missing, ["tokenizer.json"]);
+        assert_eq!(
+            resolve_translation_route("en", "zh", &tmp).unwrap()[0]
+                .pack
+                .id,
+            "en-mul"
+        );
+        remove_pack(spec.id, &tmp).unwrap();
+        assert!(!encoder.exists());
+        assert!(dir.join("keep.txt").is_file());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3303,7 +3353,7 @@ mod tests {
         eprintln!("[e2e] multi-line output:\n{}", multi);
         assert_eq!(multi.lines().count(), 2);
 
-        evict_cached_pack("en-zh");
+        remove_pack("en-zh", &tmp).unwrap();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

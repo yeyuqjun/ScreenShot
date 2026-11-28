@@ -1673,6 +1673,7 @@ pub fn download_ocr_model(
         app.notify(i18n::t("OCR model pack not found"), true);
         return;
     };
+    let model_id = pack.id.to_string();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let label = pack.display_label();
     {
@@ -1771,8 +1772,19 @@ pub fn cancel_ocr_model_download(app: &Arc<App>, model_id: &str) {
 }
 
 /// Delete a downloaded local OCR model pack.
-pub fn delete_ocr_model(app: &Arc<App>, model_id: &str, base_dir: &std::path::Path) {
-    if app.core.lock().unwrap().ocr_downloads.contains_key(model_id) {
+pub fn delete_ocr_model(
+    app: &Arc<App>,
+    model_id: &str,
+    base_dir: &std::path::Path,
+    local_dirs: &[std::path::PathBuf],
+) {
+    if app
+        .core
+        .lock()
+        .unwrap()
+        .ocr_downloads
+        .contains_key(model_id)
+    {
         app.notify(
             i18n::t("Please cancel the active download before deleting"),
             true,
@@ -1782,7 +1794,7 @@ pub fn delete_ocr_model(app: &Arc<App>, model_id: &str, base_dir: &std::path::Pa
     let label = crate::ocr::find_model_pack(model_id)
         .map(|p| p.display_label().to_string())
         .unwrap_or_else(|| model_id.to_string());
-    match crate::ocr::remove_model_pack(model_id, base_dir) {
+    match crate::ocr::remove_model_pack(model_id, base_dir, local_dirs) {
         Ok(()) => {
             app.emit(AppEvent::OcrModelsChanged);
             app.notify(
@@ -1805,6 +1817,7 @@ pub fn download_translation_pack(
         app.notify(i18n::t("Translation language pack not found"), true);
         return;
     };
+    let pack_id = spec.id.to_string();
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let label = spec.display_label();
     {

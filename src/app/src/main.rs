@@ -14,6 +14,7 @@ mod gif;
 mod hotkeys;
 mod i18n;
 mod images;
+mod model_files;
 mod native;
 mod network;
 mod ocr;
@@ -36,8 +37,10 @@ use ui::editor_window::EditorState;
 use ui::gpu::{EguiWindow, GpuContext};
 use ui::overlay::OverlayState;
 use ui::pin_window::{
-    PinUiFeedback, PinWindowState, COMPANION_GAP_LOGICAL, LANG_PICKER_HEIGHT_LOGICAL,
-    TEXT_PANEL_MIN_HEIGHT_LOGICAL, TEXT_PANEL_MIN_WIDTH_LOGICAL, TEXT_PANEL_WIDTH_LOGICAL,
+    pin_image_rect_from_window_rect, pin_shadow_pad_physical, pin_window_rect_from_image_rect,
+    PinUiFeedback, PinWindowState, LANG_PICKER_HEIGHT_LOGICAL, TEXT_PANEL_MIN_HEIGHT_LOGICAL,
+    TEXT_PANEL_MIN_WIDTH_LOGICAL, TEXT_PANEL_SHADOW_GAP_LOGICAL, TEXT_PANEL_WIDTH_LOGICAL,
+    TOOLBAR_SHADOW_GAP_LOGICAL,
 };
 use ui::recorder::RecorderState;
 use ui::settings_window::{SettingsSection, SettingsWindowState};
@@ -47,14 +50,38 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
 use winit::window::{Icon as WinitIcon, Window, WindowAttributes, WindowId, WindowLevel};
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/icon.png");
 
+fn app_icon_rgba() -> Option<&'static (Vec<u8>, u32, u32)> {
+    static DECODED: std::sync::OnceLock<Option<(Vec<u8>, u32, u32)>> = std::sync::OnceLock::new();
+    DECODED
+        .get_or_init(|| {
+            let img = image::load_from_memory(APP_ICON_PNG).ok()?.to_rgba8();
+            let (w, h) = img.dimensions();
+            Some((img.into_raw(), w, h))
+        })
+        .as_ref()
+}
+
 fn load_window_icon() -> Option<WinitIcon> {
-    let img = image::load_from_memory(APP_ICON_PNG).ok()?.to_rgba8();
-    let (w, h) = img.dimensions();
-    WinitIcon::from_rgba(img.into_raw(), w, h).ok()
+    let (rgba, w, h) = app_icon_rgba()?;
+    WinitIcon::from_rgba(rgba.clone(), *w, *h).ok()
+}
+
+/// Attach both title-bar (`ICON_SMALL`) and taskbar / Alt+Tab (`ICON_BIG`) app icons.
+fn with_app_icons(mut attrs: WindowAttributes) -> WindowAttributes {
+    if let Some(icon) = load_window_icon() {
+        #[cfg(target_os = "windows")]
+        {
+            attrs = attrs.with_taskbar_icon(Some(icon.clone()));
+        }
+        attrs = attrs.with_window_icon(Some(icon));
+    }
+    attrs
 }
 
 fn load_tray_icon() -> Result<tray_icon::Icon, String> {
@@ -82,6 +109,11 @@ fn current_theme(app: &App) -> (bool, ui::ThemeAccent, ui::TextColorSetting) {
         ui::theme_accent(&core.settings),
         ui::theme_text_color(&core.settings),
     )
+}
+
+fn current_font(app: &App) -> ui::FontSetting {
+    let core = app.core.lock().unwrap();
+    ui::theme_font(&core.settings)
 }
 
 const MAX_POOLED_OVERLAYS: usize = 4;
@@ -133,6 +165,7 @@ impl SnapDockRunner {
         let initial_settings = app.core.lock().unwrap().settings.clone();
         i18n::apply_settings(&initial_settings);
         ui::set_active_accent(ui::theme_accent(&initial_settings));
+        ui::set_active_font(ui::theme_font(&initial_settings));
         let mut hotkeys = hotkeys::HotkeyRegistry::new();
         let warnings = hotkeys.register(&initial_settings);
         app.core.lock().unwrap().hotkey_warnings = warnings.clone();
@@ -278,43 +311,59 @@ impl SnapDockRunner {
         i18n::apply_settings(&settings_val);
         self.refresh_tray();
         let (dark, accent, text_color) = current_theme(&self.app);
+        let font = current_font(&self.app);
         ui::set_active_accent(accent);
+        ui::set_active_font(font.clone());
         let clear = accent.palette().clear_color(dark);
+        let tb_clear = ui::pin_toolbar_clear_color(dark, accent);
         if let Some((_, win, _)) = &mut self.settings_window {
             win.window.set_title(i18n::t("SnapDock · Settings"));
             win.set_clear_color(clear);
             ui::apply_theme(&win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&win.egui_ctx, &font);
             win.window.request_redraw();
         }
         if let Some((_, win, state)) = &mut self.editor_window {
             win.window.set_title(&state.title());
             win.set_clear_color(clear);
             ui::apply_theme(&win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&win.egui_ctx, &font);
             win.window.request_redraw();
         }
         for (win, _) in self.overlays.values() {
             ui::apply_theme(&win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&win.egui_ctx, &font);
             win.window.request_redraw();
         }
         for entry in self.pins.values_mut() {
             ui::apply_theme(&entry.image_win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&entry.image_win.egui_ctx, &font);
             entry.image_win.window.request_redraw();
             if let Some(tb) = entry.toolbar_win.as_mut() {
-                ui::apply_theme(&tb.egui_ctx, true, accent, ui::TextColorSetting::Auto);
-                tb.window.request_redraw();
+                tb.set_clear_color(tb_clear);
+                ui::apply_theme(&tb.egui_ctx, dark, accent, text_color);
+                ui::apply_font(&tb.egui_ctx, &font);
+                if entry.toolbar_visible {
+                    tb.window.request_redraw();
+                }
             }
             if let Some(tp) = entry.text_panel_win.as_mut() {
-                tp.set_clear_color(clear);
+                tp.set_clear_color(tb_clear);
                 ui::apply_theme(&tp.egui_ctx, dark, accent, text_color);
-                tp.window.request_redraw();
+                ui::apply_font(&tp.egui_ctx, &font);
+                if entry.text_panel_visible {
+                    tp.window.request_redraw();
+                }
             }
         }
         if let Some((_, win, _)) = &self.recorder {
             ui::apply_theme(&win.egui_ctx, true, accent, ui::TextColorSetting::Auto);
+            ui::apply_font(&win.egui_ctx, &font);
             win.window.request_redraw();
         }
         if let Some((_, win, _)) = &self.toast_window {
             ui::apply_theme(&win.egui_ctx, true, accent, ui::TextColorSetting::Auto);
+            ui::apply_font(&win.egui_ctx, &font);
             win.window.request_redraw();
         }
     }
@@ -334,14 +383,13 @@ impl SnapDockRunner {
             return;
         }
 
-        let mut attrs = WindowAttributes::default()
-            .with_title(i18n::t("SnapDock · Settings"))
-            .with_inner_size(LogicalSize::new(780.0, 560.0))
-            .with_min_inner_size(LogicalSize::new(660.0, 460.0))
-            .with_visible(false);
-        if let Some(icon) = load_window_icon() {
-            attrs = attrs.with_window_icon(Some(icon));
-        }
+        let attrs = with_app_icons(
+            WindowAttributes::default()
+                .with_title(i18n::t("SnapDock · Settings"))
+                .with_inner_size(LogicalSize::new(780.0, 560.0))
+                .with_min_inner_size(LogicalSize::new(660.0, 460.0))
+                .with_visible(false),
+        );
         let Ok(window) = event_loop.create_window(attrs) else {
             return;
         };
@@ -354,7 +402,9 @@ impl SnapDockRunner {
             return;
         };
         let (dark, accent, text_color) = current_theme(&self.app);
+        let font = current_font(&self.app);
         ui::apply_theme(&egui_win.egui_ctx, dark, accent, text_color);
+        ui::apply_font(&egui_win.egui_ctx, &font);
 
         // Center within the work area of the monitor containing the cursor.
         let (cx, cy) = native::cursor_pos();
@@ -408,14 +458,13 @@ impl SnapDockRunner {
 
         let (cx, cy) = native::cursor_pos();
         let (wx, wy, ww, wh) = native::work_area_at_point(cx, cy);
-        let mut attrs = WindowAttributes::default()
-            .with_title(state.title())
-            .with_inner_size(LogicalSize::new(920.0, 640.0))
-            .with_min_inner_size(LogicalSize::new(820.0, 500.0))
-            .with_visible(false);
-        if let Some(icon) = load_window_icon() {
-            attrs = attrs.with_window_icon(Some(icon));
-        }
+        let attrs = with_app_icons(
+            WindowAttributes::default()
+                .with_title(state.title())
+                .with_inner_size(LogicalSize::new(920.0, 640.0))
+                .with_min_inner_size(LogicalSize::new(820.0, 500.0))
+                .with_visible(false),
+        );
         let Ok(window) = event_loop.create_window(attrs) else {
             return;
         };
@@ -440,7 +489,9 @@ impl SnapDockRunner {
             return;
         };
         let (dark, accent, text_color) = current_theme(&self.app);
+        let font = current_font(&self.app);
         ui::apply_theme(&egui_win.egui_ctx, dark, accent, text_color);
+        ui::apply_font(&egui_win.egui_ctx, &font);
         let inner = window.inner_size();
         egui_win.resize(gpu, inner.width, inner.height);
 
@@ -519,7 +570,9 @@ impl SnapDockRunner {
             return;
         };
         let (_, accent, _) = current_theme(&self.app);
+        let font = current_font(&self.app);
         ui::apply_theme(&egui_win.egui_ctx, true, accent, ui::TextColorSetting::Auto);
+        ui::apply_font(&egui_win.egui_ctx, &font);
 
         let scale = window.scale_factor().max(0.5);
         let desired = ToastWindowState::estimate_size(&toast);
@@ -691,6 +744,7 @@ impl SnapDockRunner {
             (active.mode.clone(), list)
         };
         let (dark, accent, text_color) = current_theme(&self.app);
+        let font = current_font(&self.app);
         let (cx, cy) = native::cursor_pos();
 
         // Prepare and reveal the cursor's monitor first for lowest perceived latency on multi-monitor setups.
@@ -747,6 +801,7 @@ impl SnapDockRunner {
                 egui_win.prepare_for_reuse();
             }
             ui::apply_theme(&egui_win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&egui_win.egui_ctx, &font);
             egui_win.resize(gpu, mw, mh);
             let mut state = OverlayState::new(&self.app, idx, mode.clone(), img);
             // Render the first frozen frame while hidden to eliminate black-screen flicker.
@@ -808,6 +863,12 @@ impl SnapDockRunner {
         (pos.0, pos.1, size.width.max(1) as i32, size.height.max(1) as i32)
     }
 
+    fn pin_image_physical_rect(entry: &PinEntry) -> (i32, i32, i32, i32) {
+        let win_rect = Self::pin_physical_rect(entry);
+        let pad_px = pin_shadow_pad_physical(entry.image_win.window.scale_factor());
+        pin_image_rect_from_window_rect(win_rect, pad_px)
+    }
+
     fn create_pin(&mut self, event_loop: &ActiveEventLoop, capture_id: &str) {
         let pin_id = format!("pin-{}", Uuid::new_v4());
         let mut state = match PinWindowState::new(&self.app, pin_id.clone(), capture_id.to_string())
@@ -834,7 +895,7 @@ impl SnapDockRunner {
             })
             .unwrap_or(cursor);
         let work_area = native::work_area_at_point(ref_pt.0, ref_pt.1);
-        let (px, py, width, height) = ui::pin_window::compute_pin_initial_rect(
+        let (img_x, img_y, img_w, img_h) = ui::pin_window::compute_pin_initial_rect(
             state.base_width,
             state.base_height,
             state.scale,
@@ -848,36 +909,38 @@ impl SnapDockRunner {
             .with_decorations(false)
             .with_resizable(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_position(PhysicalPosition::new(px, py))
-            .with_inner_size(PhysicalSize::new(width, height))
+            .with_position(PhysicalPosition::new(img_x, img_y))
+            .with_inner_size(PhysicalSize::new(img_w, img_h))
             .with_visible(false);
         let Ok(window) = event_loop.create_window(attrs) else {
             self.app.notify(i18n::t("Unable to create pin window"), true);
             return;
         };
         let window = Arc::new(window);
+        let pad_px = pin_shadow_pad_physical(window.scale_factor());
+        let (px, py, width, height) =
+            pin_window_rect_from_image_rect((img_x, img_y, img_w, img_h), pad_px);
+        let initial_opacity = ((state.opacity.clamp(20, 100) as u32) * 255 / 100) as u8;
         let Ok(gpu) = ensure_gpu(&mut self.gpu, &window) else {
             self.app
                 .notify(i18n::t("Failed to initialize graphics context"), true);
             return;
         };
-        let Ok(mut egui_win) = EguiWindow::new(gpu, window.clone(), wgpu::Color::TRANSPARENT)
-        else {
+        let Ok(mut egui_win) = EguiWindow::new_layered(gpu, window.clone(), initial_opacity) else {
             return;
         };
         let (dark, accent, text_color) = current_theme(&self.app);
+        let font = current_font(&self.app);
         ui::apply_theme(&egui_win.egui_ctx, dark, accent, text_color);
+        ui::apply_font(&egui_win.egui_ctx, &font);
         let hwnd = egui_win.hwnd();
         if let Some(h) = hwnd {
             native::set_window_tool_window(h);
-            let _ = native::set_window_opacity(
-                h,
-                ((state.opacity.clamp(20, 100) as u32) * 255 / 100) as u8,
-            );
+            native::enable_window_layered(h);
             native::set_window_pos_physical_hidden(h, px, py, width as i32, height as i32, true);
         }
         egui_win.resize(gpu, width, height);
-        // Pre-render the first frame while hidden so the pin appears seamlessly without black flash.
+        // Pre-render the first frame while hidden so the layered pin & shadow appear seamlessly without flash.
         let app_ref = self.app.clone();
         let win_ref = window.clone();
         let _ = egui_win.render(gpu, |ctx| {
@@ -936,7 +999,7 @@ impl SnapDockRunner {
 
         let pin_rect = Self::pin_physical_rect(entry);
         let scale = entry.image_win.window.scale_factor().max(0.5);
-        let gap = (COMPANION_GAP_LOGICAL as f64 * scale).round() as i32;
+        let gap = (TOOLBAR_SHADOW_GAP_LOGICAL as f64 * scale).round() as i32;
         let bar_w = (entry.toolbar_bar_size_logical.x as f64 * scale).round() as i32;
         let bar_h = (entry.toolbar_bar_size_logical.y as f64 * scale).round() as i32;
         let picker_extra_h = if entry.state.lang_picker_open() {
@@ -972,18 +1035,14 @@ impl SnapDockRunner {
             let Ok(gpu) = ensure_gpu(&mut self.gpu, &window) else {
                 return;
             };
-            let (_, accent, _) = current_theme(&self.app);
-            let pal = accent.palette();
-            let clear = wgpu::Color {
-                r: pal.floating_bg.r() as f64 / 255.0,
-                g: pal.floating_bg.g() as f64 / 255.0,
-                b: pal.floating_bg.b() as f64 / 255.0,
-                a: 1.0,
-            };
+            let (dark, accent, text_color) = current_theme(&self.app);
+            let font = current_font(&self.app);
+            let clear = ui::pin_toolbar_clear_color(dark, accent);
             let Ok(tb_win) = EguiWindow::new(gpu, window.clone(), clear) else {
                 return;
             };
-            ui::apply_theme(&tb_win.egui_ctx, true, accent, ui::TextColorSetting::Auto);
+            ui::apply_theme(&tb_win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&tb_win.egui_ctx, &font);
             if let Some(h) = tb_win.hwnd() {
                 native::set_window_tool_window(h);
                 native::set_window_round_corners(h);
@@ -1013,7 +1072,9 @@ impl SnapDockRunner {
                 let app_ref = self.app.clone();
                 let mut fb = PinUiFeedback::default();
                 let _ = tb_win.render(gpu, |ctx| {
-                    fb = entry.state.show_toolbar(ctx, &app_ref, pin_hwnd, picker_above);
+                    fb = entry
+                        .state
+                        .show_toolbar(ctx, &app_ref, pin_hwnd, scale, picker_above);
                 });
                 // Adjust immediately if first measured bar width/height differs from estimate.
                 if let Some(sz) = fb.toolbar_bar_size {
@@ -1036,7 +1097,9 @@ impl SnapDockRunner {
                         }
                         tb_win.resize(gpu, ntw.max(1) as u32, nth.max(1) as u32);
                         let _ = tb_win.render(gpu, |ctx| {
-                            let _ = entry.state.show_toolbar(ctx, &app_ref, pin_hwnd, npa);
+                            let _ = entry
+                                .state
+                                .show_toolbar(ctx, &app_ref, pin_hwnd, scale, npa);
                         });
                         if let Some(h) = tb_win.hwnd() {
                             native::set_window_pos_physical(h, nx, ny, ntw, nth, true, true);
@@ -1073,7 +1136,11 @@ impl SnapDockRunner {
             entry.toolbar_hide_deadline = None;
             entry.state.close_lang_picker();
             if let Some(tb) = &entry.toolbar_win {
-                tb.window.set_visible(false);
+                if let Some(h) = tb.hwnd() {
+                    native::hide_window(h);
+                } else {
+                    tb.window.set_visible(false);
+                }
             }
         }
     }
@@ -1087,21 +1154,28 @@ impl SnapDockRunner {
         if !want_show {
             entry.text_panel_visible = false;
             if let Some(tp) = &entry.text_panel_win {
-                tp.window.set_visible(false);
+                if let Some(h) = tp.hwnd() {
+                    native::hide_window(h);
+                } else {
+                    tp.window.set_visible(false);
+                }
             }
             return;
         }
 
-        let pin_rect = Self::pin_physical_rect(entry);
+        let pin_image_rect = Self::pin_image_physical_rect(entry);
         let scale = entry.image_win.window.scale_factor().max(0.5);
-        let gap = (COMPANION_GAP_LOGICAL as f64 * scale).round() as i32;
+        let pad_px = pin_shadow_pad_physical(scale);
+        let gap = pad_px + (TEXT_PANEL_SHADOW_GAP_LOGICAL as f64 * scale).round() as i32;
         let desired_w = (TEXT_PANEL_WIDTH_LOGICAL as f64 * scale).round() as i32;
         let min_w = (TEXT_PANEL_MIN_WIDTH_LOGICAL as f64 * scale).round() as i32;
         let min_h = (TEXT_PANEL_MIN_HEIGHT_LOGICAL as f64 * scale).round() as i32;
-        let work_area =
-            native::work_area_at_point(pin_rect.0 + pin_rect.2 / 2, pin_rect.1 + pin_rect.3 / 2);
+        let work_area = native::work_area_at_point(
+            pin_image_rect.0 + pin_image_rect.2 / 2,
+            pin_image_rect.1 + pin_image_rect.3 / 2,
+        );
         let (px, py, pw, ph) = ui::pin_window::compute_text_panel_rect(
-            pin_rect,
+            pin_image_rect,
             desired_w,
             min_w,
             min_h,
@@ -1124,15 +1198,17 @@ impl SnapDockRunner {
                 return;
             };
             let window = Arc::new(window);
-            let clear = self.panel_clear_color();
+            let (dark, accent, text_color) = current_theme(&self.app);
+            let font = current_font(&self.app);
+            let clear = ui::pin_toolbar_clear_color(dark, accent);
             let Ok(gpu) = ensure_gpu(&mut self.gpu, &window) else {
                 return;
             };
             let Ok(tp_win) = EguiWindow::new(gpu, window.clone(), clear) else {
                 return;
             };
-            let (dark, accent, text_color) = current_theme(&self.app);
             ui::apply_theme(&tp_win.egui_ctx, dark, accent, text_color);
+            ui::apply_font(&tp_win.egui_ctx, &font);
             if let Some(h) = tp_win.hwnd() {
                 native::set_window_tool_window(h);
                 native::set_window_round_corners(h);
@@ -1185,8 +1261,11 @@ impl SnapDockRunner {
             return;
         };
         let pin_rect = Self::pin_physical_rect(entry);
+        let pin_image_rect = Self::pin_image_physical_rect(entry);
         let scale = entry.image_win.window.scale_factor().max(0.5);
-        let gap = (COMPANION_GAP_LOGICAL as f64 * scale).round() as i32;
+        let pad_px = pin_shadow_pad_physical(scale);
+        let toolbar_gap = (TOOLBAR_SHADOW_GAP_LOGICAL as f64 * scale).round() as i32;
+        let panel_gap = pad_px + (TEXT_PANEL_SHADOW_GAP_LOGICAL as f64 * scale).round() as i32;
         let work_area =
             native::work_area_at_point(pin_rect.0 + pin_rect.2 / 2, pin_rect.1 + pin_rect.3 / 2);
 
@@ -1202,7 +1281,7 @@ impl SnapDockRunner {
                 pin_rect,
                 (bar_w, bar_h),
                 picker_extra_h,
-                gap,
+                toolbar_gap,
                 work_area,
             );
             entry.toolbar_picker_above = picker_above;
@@ -1222,11 +1301,11 @@ impl SnapDockRunner {
             let min_w = (TEXT_PANEL_MIN_WIDTH_LOGICAL as f64 * scale).round() as i32;
             let min_h = (TEXT_PANEL_MIN_HEIGHT_LOGICAL as f64 * scale).round() as i32;
             let (px, py, pw, ph) = ui::pin_window::compute_text_panel_rect(
-                pin_rect,
+                pin_image_rect,
                 desired_w,
                 min_w,
                 min_h,
-                gap,
+                panel_gap,
                 work_area,
                 entry.state.text_panel_offset,
             );
@@ -1261,6 +1340,9 @@ impl SnapDockRunner {
             if fb.keep_toolbar_open {
                 entry.toolbar_hide_deadline = None;
             }
+            if let Some(alpha) = fb.opacity_changed {
+                entry.image_win.set_layered_opacity(alpha);
+            }
         }
 
         if fb.hide_toolbar {
@@ -1277,12 +1359,12 @@ impl SnapDockRunner {
             if fb.redraw_image {
                 entry.image_win.window.request_redraw();
             }
-            if fb.redraw_toolbar {
+            if fb.redraw_toolbar && entry.toolbar_visible {
                 if let Some(tb) = &entry.toolbar_win {
                     tb.window.request_redraw();
                 }
             }
-            if fb.redraw_text_panel {
+            if fb.redraw_text_panel && entry.text_panel_visible {
                 if let Some(tp) = &entry.text_panel_win {
                     tp.window.request_redraw();
                 }
@@ -1327,19 +1409,35 @@ impl SnapDockRunner {
         };
         for entry in self.pins.values_mut() {
             if hidden {
-                entry.image_win.window.set_visible(false);
+                if let Some(h) = entry.image_win.hwnd() {
+                    native::hide_window(h);
+                } else {
+                    entry.image_win.window.set_visible(false);
+                }
                 entry.toolbar_visible = false;
                 entry.toolbar_hide_deadline = None;
                 entry.state.close_lang_picker();
                 if let Some(tb) = &entry.toolbar_win {
-                    tb.window.set_visible(false);
+                    if let Some(h) = tb.hwnd() {
+                        native::hide_window(h);
+                    } else {
+                        tb.window.set_visible(false);
+                    }
                 }
                 if let Some(tp) = &entry.text_panel_win {
-                    tp.window.set_visible(false);
+                    if let Some(h) = tp.hwnd() {
+                        native::hide_window(h);
+                    } else {
+                        tp.window.set_visible(false);
+                    }
+                    entry.text_panel_visible = false;
                 }
             } else {
                 if let Some(h) = entry.image_win.hwnd() {
                     native::set_window_click_through(h, false);
+                    native::show_window_no_activate(h);
+                } else {
+                    entry.image_win.window.set_visible(true);
                 }
                 entry.state.passthrough = false;
                 if let Some(ps) = self
@@ -1352,11 +1450,14 @@ impl SnapDockRunner {
                 {
                     ps.passthrough = false;
                 }
-                entry.image_win.window.set_visible(true);
                 entry.image_win.window.request_redraw();
                 if entry.state.wants_text_panel() {
                     if let Some(tp) = &entry.text_panel_win {
-                        tp.window.set_visible(true);
+                        if let Some(h) = tp.hwnd() {
+                            native::show_window_no_activate(h);
+                        } else {
+                            tp.window.set_visible(true);
+                        }
                         tp.window.request_redraw();
                         entry.text_panel_visible = true;
                     }
@@ -1394,7 +1495,9 @@ impl SnapDockRunner {
             return;
         };
         let (_, accent, _) = current_theme(&self.app);
+        let font = current_font(&self.app);
         ui::apply_theme(&egui_win.egui_ctx, true, accent, ui::TextColorSetting::Auto);
+        ui::apply_font(&egui_win.egui_ctx, &font);
         if let Some(hwnd) = egui_win.hwnd() {
             native::set_window_tool_window(hwnd);
             native::set_window_exclude_from_capture(hwnd, true);
@@ -1537,17 +1640,27 @@ impl ApplicationHandler<AppEvent> for SnapDockRunner {
                         entry.image_win.window.request_redraw();
                     }
                 }
-                TextTarget::SettingsTest => match result {
-                    Ok(text) => {
-                        let preview: String = text.chars().take(120).collect();
-                        self.show_toast(
-                            event_loop,
-                            i18n::tf("Provider test succeeded: {preview}", &[("preview", &preview)]),
-                            false,
-                        );
+                TextTarget::SettingsTest => {
+                    if let Some((_, win, state)) = self.settings_window.as_mut() {
+                        state.apply_provider_test_result(&kind, result);
+                        win.window.request_redraw();
+                    } else {
+                        match result {
+                            Ok(text) => {
+                                let preview: String = text.chars().take(120).collect();
+                                self.show_toast(
+                                    event_loop,
+                                    i18n::tf(
+                                        "Provider test succeeded: {preview}",
+                                        &[("preview", &preview)],
+                                    ),
+                                    false,
+                                );
+                            }
+                            Err(e) => self.show_toast(event_loop, e, true),
+                        }
                     }
-                    Err(e) => self.show_toast(event_loop, e, true),
-                },
+                }
             },
             AppEvent::PinOverlayResult {
                 pin_id,
@@ -1748,6 +1861,14 @@ impl ApplicationHandler<AppEvent> for SnapDockRunner {
                             }
                             self.reposition_pin_companions(&pin_id);
                         }
+                        WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                            if let Some(entry) = self.pins.get(&pin_id) {
+                                entry
+                                    .state
+                                    .sync_window_size_for_scale(entry.image_win.hwnd(), *scale_factor);
+                            }
+                            self.reposition_pin_companions(&pin_id);
+                        }
                         WindowEvent::Moved(_) => {
                             self.reposition_pin_companions(&pin_id);
                         }
@@ -1823,7 +1944,10 @@ impl ApplicationHandler<AppEvent> for SnapDockRunner {
                         }
                         WindowEvent::CursorLeft { .. } => {
                             if let Some(entry) = self.pins.get_mut(&pin_id) {
-                                if entry.toolbar_visible && !entry.state.lang_picker_open() {
+                                if entry.toolbar_visible
+                                    && !entry.state.lang_picker_open()
+                                    && !entry.state.passthrough
+                                {
                                     entry.toolbar_hide_deadline = Some(
                                         std::time::Instant::now()
                                             + std::time::Duration::from_millis(260),
@@ -1853,12 +1977,17 @@ impl ApplicationHandler<AppEvent> for SnapDockRunner {
                             {
                                 let app = self.app.clone();
                                 let pin_hwnd = entry.image_win.hwnd();
+                                let pin_scale = entry.image_win.window.scale_factor();
                                 let picker_above = entry.toolbar_picker_above;
                                 if let Some(tb) = entry.toolbar_win.as_mut() {
                                     tb.render(gpu, |ctx| {
-                                        fb = entry
-                                            .state
-                                            .show_toolbar(ctx, &app, pin_hwnd, picker_above);
+                                        fb = entry.state.show_toolbar(
+                                            ctx,
+                                            &app,
+                                            pin_hwnd,
+                                            pin_scale,
+                                            picker_above,
+                                        );
                                     })
                                 } else {
                                     None
@@ -2049,7 +2178,10 @@ impl ApplicationHandler<AppEvent> for SnapDockRunner {
             if now < deadline {
                 continue;
             }
-            if entry.state.lang_picker_open() || entry.state.drag_origin.is_some() {
+            if entry.state.lang_picker_open()
+                || entry.state.drag_origin.is_some()
+                || entry.state.passthrough
+            {
                 entry.toolbar_hide_deadline = None;
                 continue;
             }
@@ -2171,6 +2303,9 @@ fn main() {
     }) else {
         return;
     };
+
+    // Apply system language before reading settings so early startup dialogs follow OS language.
+    i18n::set_language_from_str("system");
 
     // Preload system CJK font bytes on a background thread while finishing startup.
     std::thread::spawn(ui::preload_fonts);

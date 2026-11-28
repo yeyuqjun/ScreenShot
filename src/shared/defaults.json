@@ -1,5 +1,5 @@
 {
-  "general": { "language": "en", "theme": "light", "accent": "mint", "textColor": "auto", "launchAtLogin": false, "closeToTray": true },
+  "general": { "language": "system", "theme": "light", "accent": "mint", "textColor": "auto", "fontFamily": "", "fontSize": 13, "fontBold": false, "fontItalic": false, "launchAtLogin": false, "closeToTray": true },
   "capture": {
     "detectWindows": true,
     "detectControls": false,
@@ -32,6 +32,7 @@
   "annotations": {
     "rect": {
       "color": "#ef6656",
+      "fillColor": null,
       "width": 3,
       "fontSize": 24,
       "fontFamily": "Microsoft YaHei",
@@ -46,6 +47,7 @@
     },
     "ellipse": {
       "color": "#ef6656",
+      "fillColor": null,
       "width": 3,
       "fontSize": 24,
       "fontFamily": "Microsoft YaHei",

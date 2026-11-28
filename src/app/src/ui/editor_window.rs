@@ -248,12 +248,19 @@ impl EditorState {
         window: &winit::window::Window,
     ) {
         let typing = ctx.wants_keyboard_input();
-        let (esc, ctrl_z, ctrl_c, ctrl_s) = ctx.input(|i| {
+        let (esc, ctrl_z, ctrl_c, ctrl_s, del, shift, arrow) = ctx.input(|i| {
+            let dx = (i.key_pressed(egui::Key::ArrowRight) as i32)
+                - (i.key_pressed(egui::Key::ArrowLeft) as i32);
+            let dy = (i.key_pressed(egui::Key::ArrowDown) as i32)
+                - (i.key_pressed(egui::Key::ArrowUp) as i32);
             (
                 i.key_pressed(egui::Key::Escape),
                 i.modifiers.command && i.key_pressed(egui::Key::Z),
                 i.modifiers.command && i.key_pressed(egui::Key::C),
                 i.modifiers.command && i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                i.modifiers.shift,
+                (dx, dy),
             )
         });
         if ctrl_s {
@@ -261,7 +268,7 @@ impl EditorState {
             return;
         }
         if esc {
-            if self.annotations.editing.is_some() {
+            if self.annotations.has_selection() {
                 self.annotations.finish_text();
             } else if !typing {
                 service::close_result(app, Some(&self.id));
@@ -271,7 +278,13 @@ impl EditorState {
         if typing {
             return;
         }
-        if ctrl_z {
+        if del && self.annotations.has_selection() {
+            self.annotations.delete_selected();
+        } else if (arrow.0 != 0 || arrow.1 != 0) && self.annotations.has_selection() {
+            let step = if shift { 10.0 } else { 1.0 };
+            self.annotations
+                .nudge_selected(arrow.0 as f32 * step, arrow.1 as f32 * step);
+        } else if ctrl_z {
             self.annotations.undo();
         } else if ctrl_c {
             self.copy(app);
@@ -287,6 +300,9 @@ impl EditorState {
                 ui.horizontal(|ui| {
                     if gif {
                         let frames = self.gif_player.as_ref().map(|p| p.frames.len()).unwrap_or(0);
+                        let accent_text =
+                            ui::ctx_palette(ctx).accent_text(ctx.style().visuals.dark_mode);
+                        icons::paint_inline(ui, Icon::RecordGif, 16.0, accent_text);
                         ui.label(RichText::new(i18n::t("Animated GIF")).strong());
                         ui.label(
                             RichText::new(i18n::tf(
@@ -504,8 +520,28 @@ impl EditorState {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut panel.tab, 0, i18n::t("Recognized Text"));
-                    ui.selectable_value(&mut panel.tab, 1, i18n::t("Translation Result"));
+                    if icons::small_icon_text_button(
+                        ui,
+                        Icon::Ocr,
+                        i18n::t("Recognized Text"),
+                        panel.tab == 0,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        panel.tab = 0;
+                    }
+                    if icons::small_icon_text_button(
+                        ui,
+                        Icon::Translate,
+                        i18n::t("Translation Result"),
+                        panel.tab == 1,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        panel.tab = 1;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icons::small_icon_button(ui, Icon::Close)
                             .on_hover_text(i18n::t("Close"))
@@ -535,10 +571,16 @@ impl EditorState {
                             cur_src_val = picked;
                             langs_changed = true;
                         }
-                        if ui
-                            .button("\u{21C4}")
-                            .on_hover_text(i18n::t("Swap source and target languages"))
-                            .clicked()
+                        if icons::icon_button_sized(
+                            ui,
+                            Icon::Swap,
+                            Vec2::splat(28.0),
+                            15.0,
+                            false,
+                            false,
+                        )
+                        .on_hover_text(i18n::t("Swap source and target languages"))
+                        .clicked()
                         {
                             let new_src = if tgt_code == "auto" {
                                 "zh".to_string()
@@ -595,11 +637,20 @@ impl EditorState {
                     );
                 });
                 ui.horizontal(|ui| {
-                    if ui.link(i18n::t("Provider Settings")).clicked() {
-                        app.emit(AppEvent::OpenSettings {
-                            section: Some("providers".into()),
-                        });
-                    }
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        icons::paint_inline(
+                            ui,
+                            Icon::SettingsGeneral,
+                            13.0,
+                            ui.visuals().hyperlink_color,
+                        );
+                        if ui.link(i18n::t("Provider Settings")).clicked() {
+                            app.emit(AppEvent::OpenSettings {
+                                section: Some("providers".into()),
+                            });
+                        }
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled_ui(!buf.is_empty(), |ui| {
                             if icons::icon_text_button(

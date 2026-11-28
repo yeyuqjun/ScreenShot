@@ -6,21 +6,26 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::sync::OnceLock;
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT,
-    POINT, RECT, WPARAM,
+    CloseHandle, GetLastError, COLORREF, ERROR_ALREADY_EXISTS, ERROR_NO_MORE_ITEMS, HANDLE, HWND,
+    LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
-    MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject,
+    EndPaint, FillRect, GetMonitorInfoW, MonitorFromPoint, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumValueW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER,
+    HKEY_LOCAL_MACHINE, KEY_READ, REG_EXPAND_SZ, REG_SZ, RRF_RT_REG_DWORD,
+};
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Threading::{AttachThreadInput, CreateMutexW, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -32,12 +37,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
     IsIconic, IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetCursorPos,
     SetForegroundWindow, SetLayeredWindowAttributes, SetWindowDisplayAffinity, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY, MSG, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
-    WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_DESTROY, WM_PAINT, WNDCLASSW, WS_EX_APPWINDOW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
-    WS_VISIBLE,
+    SetWindowPos, ShowWindow, TranslateMessage, UpdateLayeredWindow, WindowFromPoint, GA_ROOT,
+    GWL_EXSTYLE, HWND_TOPMOST, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, LWA_COLORKEY, MSG,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOWNOACTIVATE,
+    ULW_ALPHA, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WM_APP, WM_DESTROY, WM_PAINT, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
 };
 
 /// Physical-pixel window rectangle and title.
@@ -368,6 +374,7 @@ pub fn system_prefers_dark() -> bool {
 }
 
 /// Set overall window opacity (`WS_EX_LAYERED` + `LWA_ALPHA`).
+#[allow(dead_code)]
 pub fn set_window_opacity(hwnd: isize, alpha: u8) -> Result<(), String> {
     unsafe {
         let handle = HWND(hwnd as *mut _);
@@ -383,6 +390,161 @@ pub fn set_window_opacity(hwnd: isize, alpha: u8) -> Result<(), String> {
     }
 }
 
+/// Enable `WS_EX_LAYERED` for per-pixel alpha presentation via `UpdateLayeredWindow`
+/// (must not be combined with `SetLayeredWindowAttributes`).
+pub fn enable_window_layered(hwnd: isize) {
+    unsafe {
+        let handle = HWND(hwnd as *mut _);
+        let style = GetWindowLongPtrW(handle, GWL_EXSTYLE) as u32;
+        if (style & WS_EX_LAYERED.0) == 0 {
+            SetWindowLongPtrW(handle, GWL_EXSTYLE, (style | WS_EX_LAYERED.0) as isize);
+        }
+    }
+}
+
+/// Reusable top-down 32-bit premultiplied BGRA DIB section + memory DC for `UpdateLayeredWindow`.
+pub struct LayeredDib {
+    mem_dc: HDC,
+    bitmap: HBITMAP,
+    old_obj: HGDIOBJ,
+    bits: *mut u8,
+    width: u32,
+    height: u32,
+}
+
+impl LayeredDib {
+    pub fn new(width: u32, height: u32) -> Result<Self, String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        unsafe {
+            let mem_dc = CreateCompatibleDC(None);
+            if mem_dc.is_invalid() {
+                return Err("CreateCompatibleDC failed".to_string());
+            }
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: width as i32,
+                    biHeight: -(height as i32), // top-down DIB matching wgpu row order
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bitmap = match CreateDIBSection(
+                Some(mem_dc),
+                &bmi,
+                DIB_RGB_COLORS,
+                &mut bits,
+                None,
+                0,
+            ) {
+                Ok(bmp) if !bmp.is_invalid() && !bits.is_null() => bmp,
+                Ok(bmp) => {
+                    if !bmp.is_invalid() {
+                        let _ = DeleteObject(bmp.into());
+                    }
+                    let _ = DeleteDC(mem_dc);
+                    return Err("CreateDIBSection returned null pixel buffer".to_string());
+                }
+                Err(e) => {
+                    let _ = DeleteDC(mem_dc);
+                    return Err(format!("CreateDIBSection failed: {}", e));
+                }
+            };
+            let old_obj = SelectObject(mem_dc, bitmap.into());
+            Ok(Self {
+                mem_dc,
+                bitmap,
+                old_obj,
+                bits: bits as *mut u8,
+                width,
+                height,
+            })
+        }
+    }
+
+    /// Copy tightly- or 256B-aligned premultiplied BGRA8 rows into the DIB buffer and clamp
+    /// RGB <= A on translucent pixels to satisfy Win32 `AC_SRC_ALPHA` invariants.
+    pub fn copy_from_padded_bgra(&mut self, src: &[u8], padded_bytes_per_row: usize) {
+        let unpadded = (self.width as usize) * 4;
+        if padded_bytes_per_row < unpadded {
+            return;
+        }
+        let rows = (self.height as usize).min(src.len() / padded_bytes_per_row);
+        for y in 0..rows {
+            let src_start = y * padded_bytes_per_row;
+            let src_row = &src[src_start..src_start + unpadded];
+            let dst_row = unsafe {
+                std::slice::from_raw_parts_mut(self.bits.add(y * unpadded), unpadded)
+            };
+            dst_row.copy_from_slice(src_row);
+            for px in dst_row.chunks_exact_mut(4) {
+                let a = px[3];
+                if a < 255 {
+                    if px[0] > a {
+                        px[0] = a;
+                    }
+                    if px[1] > a {
+                        px[1] = a;
+                    }
+                    if px[2] > a {
+                        px[2] = a;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Present the current premultiplied DIB to a `WS_EX_LAYERED` window with global `opacity`.
+    pub fn present(&self, hwnd: isize, opacity: u8) -> Result<(), String> {
+        let size = SIZE {
+            cx: self.width as i32,
+            cy: self.height as i32,
+        };
+        let src_pt = POINT { x: 0, y: 0 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: opacity,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
+        unsafe {
+            UpdateLayeredWindow(
+                HWND(hwnd as *mut _),
+                None,
+                None,
+                Some(&size),
+                Some(self.mem_dc),
+                Some(&src_pt),
+                COLORREF(0),
+                Some(&blend),
+                ULW_ALPHA,
+            )
+            .map_err(|e| e.to_string())
+        }
+    }
+}
+
+impl Drop for LayeredDib {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.mem_dc.is_invalid() {
+                if !self.old_obj.is_invalid() {
+                    SelectObject(self.mem_dc, self.old_obj);
+                }
+                if !self.bitmap.is_invalid() {
+                    let _ = DeleteObject(self.bitmap.into());
+                }
+                let _ = DeleteDC(self.mem_dc);
+            }
+        }
+    }
+}
+
 /// Toggle window mouse click-through (`WS_EX_TRANSPARENT`).
 pub fn set_window_click_through(hwnd: isize, enabled: bool) {
     unsafe {
@@ -394,7 +556,129 @@ pub fn set_window_click_through(hwnd: isize, enabled: bool) {
             style &= !WS_EX_TRANSPARENT.0;
         }
         SetWindowLongPtrW(handle, GWL_EXSTYLE, style as isize);
+        // Notify Win32/DWM to refresh cached extended window styles immediately.
+        let _ = SetWindowPos(
+            handle,
+            None,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
     }
+}
+
+/// Hide a window via Win32 `ShowWindow(SW_HIDE)` without relying on winit's cached visibility flag
+/// or clobbering custom `GWL_EXSTYLE` bits (`WS_EX_TOOLWINDOW`, `WS_EX_LAYERED`).
+pub fn hide_window(hwnd: isize) {
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd as *mut _), SW_HIDE);
+    }
+}
+
+/// Show a window via Win32 `ShowWindow(SW_SHOWNOACTIVATE)` without clobbering custom `GWL_EXSTYLE` bits.
+pub fn show_window_no_activate(hwnd: isize) {
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd as *mut _), SW_SHOWNOACTIVATE);
+    }
+}
+
+/// Enumerate installed TrueType / OpenType font entries `(registry_display_name, file_path)` from
+/// Windows system and per-user font registry keys.
+pub fn list_system_font_entries() -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let win_fonts_dir = std::env::var_os("WINDIR")
+        .map(|w| PathBuf::from(w).join("Fonts"))
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows\Fonts"));
+    let user_fonts_dir = std::env::var_os("LOCALAPPDATA")
+        .map(|d| PathBuf::from(d).join("Microsoft").join("Windows").join("Fonts"));
+
+    let roots: &[(HKEY, Option<&PathBuf>)] = &[
+        (HKEY_LOCAL_MACHINE, Some(&win_fonts_dir)),
+        (HKEY_CURRENT_USER, user_fonts_dir.as_ref()),
+    ];
+
+    for &(root, base_dir) in roots {
+        unsafe {
+            let mut key = HKEY::default();
+            let err = RegOpenKeyExW(
+                root,
+                w!("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"),
+                None,
+                KEY_READ,
+                &mut key,
+            );
+            if err.is_err() {
+                continue;
+            }
+            let mut index = 0u32;
+            let mut name_buf = vec![0u16; 512];
+            let mut data_buf = vec![0u8; 2048];
+            loop {
+                let mut name_len = name_buf.len() as u32;
+                let mut data_len = data_buf.len() as u32;
+                let mut reg_type = 0u32;
+                let res = RegEnumValueW(
+                    key,
+                    index,
+                    Some(PWSTR(name_buf.as_mut_ptr())),
+                    &mut name_len,
+                    None,
+                    Some(&mut reg_type),
+                    Some(data_buf.as_mut_ptr()),
+                    Some(&mut data_len),
+                );
+                if res == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                index += 1;
+                if res.is_err() || (reg_type != REG_SZ.0 && reg_type != REG_EXPAND_SZ.0) {
+                    continue;
+                }
+                let name = String::from_utf16_lossy(&name_buf[..name_len as usize])
+                    .trim()
+                    .to_string();
+                let u16_count = (data_len as usize) / 2;
+                let mut wide = Vec::with_capacity(u16_count);
+                for chunk in data_buf[..u16_count * 2].chunks_exact(2) {
+                    let code = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    if code == 0 {
+                        break;
+                    }
+                    wide.push(code);
+                }
+                let raw_file = String::from_utf16_lossy(&wide).trim().to_string();
+                if name.is_empty() || raw_file.is_empty() {
+                    continue;
+                }
+                let raw_path = PathBuf::from(&raw_file);
+                let resolved = if raw_path.is_absolute() {
+                    raw_path
+                } else if let Some(dir) = base_dir {
+                    let candidate = dir.join(&raw_path);
+                    if candidate.is_file() {
+                        candidate
+                    } else {
+                        win_fonts_dir.join(&raw_path)
+                    }
+                } else {
+                    win_fonts_dir.join(&raw_path)
+                };
+                let ext_ok = resolved.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                    matches!(
+                        e.to_ascii_lowercase().as_str(),
+                        "ttf" | "ttc" | "otf" | "otc"
+                    )
+                });
+                if ext_ok && resolved.is_file() {
+                    out.push((name, resolved));
+                }
+            }
+            let _ = RegCloseKey(key);
+        }
+    }
+    out
 }
 
 /// Local timestamp for default filenames, formatted like `20261122_174212`.

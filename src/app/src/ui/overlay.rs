@@ -245,7 +245,7 @@ impl OverlayState {
             let wants_kb = ctx.wants_keyboard_input();
             let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             if esc {
-                if self.annotations.editing.is_some() {
+                if self.annotations.has_selection() {
                     self.annotations.finish_text();
                     return;
                 }
@@ -253,22 +253,24 @@ impl OverlayState {
                 return;
             }
             if !wants_kb {
-                let (enter, ctrl_a, ctrl_z, ctrl_c, ctrl_s, key_c, shift, arrow) = ctx.input(|i| {
-                    let dx = (i.key_pressed(egui::Key::ArrowRight) as i32)
-                        - (i.key_pressed(egui::Key::ArrowLeft) as i32);
-                    let dy = (i.key_pressed(egui::Key::ArrowDown) as i32)
-                        - (i.key_pressed(egui::Key::ArrowUp) as i32);
-                    (
-                        i.key_pressed(egui::Key::Enter),
-                        i.modifiers.command && i.key_pressed(egui::Key::A),
-                        i.modifiers.command && i.key_pressed(egui::Key::Z),
-                        i.modifiers.command && i.key_pressed(egui::Key::C),
-                        i.modifiers.command && i.key_pressed(egui::Key::S),
-                        !i.modifiers.any() && i.key_pressed(egui::Key::C),
-                        i.modifiers.shift,
-                        (dx, dy),
-                    )
-                });
+                let (enter, ctrl_a, ctrl_z, ctrl_c, ctrl_s, key_c, del, shift, arrow) =
+                    ctx.input(|i| {
+                        let dx = (i.key_pressed(egui::Key::ArrowRight) as i32)
+                            - (i.key_pressed(egui::Key::ArrowLeft) as i32);
+                        let dy = (i.key_pressed(egui::Key::ArrowDown) as i32)
+                            - (i.key_pressed(egui::Key::ArrowUp) as i32);
+                        (
+                            i.key_pressed(egui::Key::Enter),
+                            i.modifiers.command && i.key_pressed(egui::Key::A),
+                            i.modifiers.command && i.key_pressed(egui::Key::Z),
+                            i.modifiers.command && i.key_pressed(egui::Key::C),
+                            i.modifiers.command && i.key_pressed(egui::Key::S),
+                            !i.modifiers.any() && i.key_pressed(egui::Key::C),
+                            i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                            i.modifiers.shift,
+                            (dx, dy),
+                        )
+                    });
                 if ctrl_a {
                     self.annotations.reset();
                     self.annotations.tool = Tool::Select;
@@ -279,6 +281,8 @@ impl OverlayState {
                     let act = self.default_confirm_action();
                     self.commit_selection(app, act);
                     return;
+                } else if del && self.annotations.has_selection() {
+                    self.annotations.delete_selected();
                 } else if ctrl_z {
                     self.annotations.undo();
                 } else if ctrl_c && self.selection_px.is_some() && !self.long_ready {
@@ -300,14 +304,18 @@ impl OverlayState {
                             ctx.request_repaint_after(Duration::from_millis(1500));
                         }
                     }
-                } else if (arrow.0 != 0 || arrow.1 != 0) && self.annotations.editing.is_none() {
-                    if let Some(sel) = self.selection_px {
-                        let step = if shift { 10.0 } else { 1.0 };
+                } else if arrow.0 != 0 || arrow.1 != 0 {
+                    let step = if shift { 10.0 } else { 1.0 };
+                    if self.annotations.has_selection() {
+                        self.annotations
+                            .nudge_selected(arrow.0 as f32 * step, arrow.1 as f32 * step);
+                    } else if let Some(sel) = self.selection_px {
                         let w = sel.width();
                         let h = sel.height();
                         let nx = (sel.min.x + arrow.0 as f32 * step).clamp(0.0, img_w - w);
                         let ny = (sel.min.y + arrow.1 as f32 * step).clamp(0.0, img_h - h);
-                        self.selection_px = Some(Rect::from_min_size(Pos2::new(nx, ny), Vec2::new(w, h)));
+                        self.selection_px =
+                            Some(Rect::from_min_size(Pos2::new(nx, ny), Vec2::new(w, h)));
                     }
                 }
             }
@@ -316,13 +324,13 @@ impl OverlayState {
         let is_annotating = self.selection_px.is_some()
             && !self.long_ready
             && self.drag.is_none()
-            && (self.annotations.tool != Tool::Select || self.annotations.editing.is_some());
+            && (self.annotations.tool != Tool::Select || self.annotations.has_selection());
 
-        // Right-click shortcut: exit annotation mode first, otherwise cancel capture.
+        // Right-click shortcut: deselect active element or exit annotation mode first, otherwise cancel capture.
         if !ctx.is_pointer_over_area()
             && ctx.input(|i| i.pointer.secondary_clicked())
         {
-            if self.annotations.editing.is_some() {
+            if self.annotations.has_selection() {
                 self.annotations.finish_text();
             } else if is_annotating {
                 self.annotations.tool = Tool::Select;
@@ -394,7 +402,7 @@ impl OverlayState {
                         let sel_logical = to_logical_rect(sel_px);
                         if !self.annotations.strokes.is_empty()
                             || self.annotations.draft.is_some()
-                            || self.annotations.editing.is_some()
+                            || self.annotations.has_selection()
                             || is_annotating
                         {
                             canvas::show_annotation_canvas(
@@ -566,11 +574,13 @@ impl OverlayState {
                         }
                     }
                 } else if is_annotating && !ctx.is_pointer_over_area() {
-                    let icon = if self.annotations.tool.is_text() {
-                        CursorIcon::Text
-                    } else {
-                        CursorIcon::Crosshair
-                    };
+                    let icon = self.annotations.last_cursor.unwrap_or_else(|| {
+                        if self.annotations.tool.is_text() {
+                            CursorIcon::Text
+                        } else {
+                            CursorIcon::Crosshair
+                        }
+                    });
                     ctx.set_cursor_icon(icon);
                 }
 
@@ -696,7 +706,10 @@ impl OverlayState {
                         .corner_radius(CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(14, 7))
                         .show(ui, |ui| {
-                            ui.label(RichText::new(text).color(Color32::WHITE).strong());
+                            ui.horizontal(|ui| {
+                                icons::paint_inline(ui, Icon::Check, 14.0, Color32::WHITE);
+                                ui.label(RichText::new(text).color(Color32::WHITE).strong());
+                            });
                         });
                 });
         }
@@ -732,6 +745,12 @@ impl OverlayState {
                                 .inner_margin(egui::Margin::symmetric(12, 8))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
+                                        icons::paint_inline(
+                                            ui,
+                                            Icon::LongCapture,
+                                            16.0,
+                                            palette.accent_text(ui.visuals().dark_mode),
+                                        );
                                         ui.label(
                                             RichText::new(i18n::t("Scrolling Capture Ready"))
                                                 .strong(),
@@ -926,8 +945,17 @@ impl OverlayState {
                         .inner_margin(egui::Margin::symmetric(14, 8))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
+                                icons::paint_inline(ui, Icon::Alert, 15.0, Color32::WHITE);
                                 ui.label(RichText::new(err_msg).color(Color32::WHITE));
-                                if ui.button(i18n::t("Close")).clicked() {
+                                if icons::dark_icon_text_button(
+                                    ui,
+                                    Icon::Close,
+                                    i18n::t("Close"),
+                                    Color32::from_rgba_unmultiplied(0, 0, 0, 55),
+                                    Color32::from_rgba_unmultiplied(0, 0, 0, 95),
+                                )
+                                .clicked()
+                                {
                                     service::cancel_capture(app);
                                 }
                             });

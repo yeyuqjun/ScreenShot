@@ -7,6 +7,7 @@
 use crate::annotations::{Point, Stroke, Tool};
 use crate::i18n;
 use crate::images::Rgba;
+use crate::model_files::{self, PendingFile};
 use image::RgbImage;
 use rapidocr_core::config::{ExecutionProvider, InferenceOptions, PipelineConfig};
 use rapidocr_core::model::{
@@ -21,9 +22,6 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// Default preferred model set (PP-OCRv5 mobile multilingual/CJK).
-pub const DEFAULT_MODEL_SET: &ModelSetSpec = &PPOCRV5_CH_MOBILE;
 
 /// Model tier tag displayed in the Settings UI catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,14 +150,13 @@ pub struct OcrModelInstallState {
     pub pack: &'static OcrModelPackSpec,
     /// True when all files required for the active pipeline (`use_cls`) are present.
     pub installed: bool,
-    /// True when the orientation classifier (`cls`) model file is also present.
-    pub has_cls: bool,
-    /// True when installed in its managed `<storage_dir>/<id>/` subdirectory (safe to delete).
-    pub managed: bool,
     /// Directory containing this model pack (or canonical target directory if not installed).
     pub dir: PathBuf,
     /// Total disk usage in bytes for this pack's present files.
     pub disk_bytes: u64,
+    pub missing: Vec<&'static str>,
+    pub invalid: Vec<&'static str>,
+    pub local_dirs: Vec<PathBuf>,
 }
 
 /// Download progress snapshot for a single OCR model pack.
@@ -212,7 +209,13 @@ struct CachedEngine {
     engine: RapidOcr,
 }
 
+struct SharedRuntimeState {
+    runtime: OcrRuntime,
+    dll_path: PathBuf,
+}
+
 static ENGINE_CACHE: Mutex<Option<CachedEngine>> = Mutex::new(None);
+static SHARED_RUNTIME: Mutex<Option<SharedRuntimeState>> = Mutex::new(None);
 
 /// Default root models directory next to the executable: `<exe_dir>/models`.
 pub fn default_exe_model_dir() -> PathBuf {
@@ -279,12 +282,66 @@ fn fallback_model_dirs(custom_dir: &str, storage_dir: &Path, data_dir: &Path) ->
     dedup_paths(dirs)
 }
 
+fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !text.is_empty() && !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        source = cause.source();
+    }
+    out
+}
+
+/// Return the `onnxruntime.dll` path already loaded into this process, if any.
+fn loaded_runtime_dll() -> Option<PathBuf> {
+    SHARED_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|state| state.dll_path.clone())
+}
+
+/// Load or reuse the process-wide shared ONNX Runtime environment.
+///
+/// ONNX Runtime and `rapidocr-core` only allow a single loaded library and
+/// environment per process. Once initialized, both local OCR and local
+/// translation reuse the same runtime even if model directories change later.
+pub fn load_shared_runtime(dll_path: &Path) -> Result<OcrRuntime, String> {
+    let mut guard = SHARED_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = guard.as_ref() {
+        return Ok(state.runtime.clone());
+    }
+    let runtime = OcrRuntime::load_from(dll_path).map_err(|e| {
+        i18n::tf(
+            "Unable to load ONNX Runtime ({path}): {err}",
+            &[
+                ("path", &dll_path.display().to_string()),
+                ("err", &format_error_chain(&e)),
+            ],
+        )
+    })?;
+    *guard = Some(SharedRuntimeState {
+        runtime: runtime.clone(),
+        dll_path: dll_path.to_path_buf(),
+    });
+    Ok(runtime)
+}
+
 /// Locate an available `onnxruntime.dll` shared by local OCR and local translation.
 pub fn resolve_runtime_dll(
     custom_dir: &str,
     preferred_dir: Option<&Path>,
     data_dir: &Path,
 ) -> Option<PathBuf> {
+    if let Some(loaded) = loaded_runtime_dll().filter(|p| p.is_file()) {
+        return Some(loaded);
+    }
     candidate_runtime_dlls(custom_dir, preferred_dir, data_dir)
         .into_iter()
         .find(|p| p.is_file())
@@ -308,6 +365,13 @@ fn candidate_runtime_dlls(
             }
         }
     }
+    let exe = exe_dir();
+    if !exe.as_os_str().is_empty() {
+        paths.push(exe.join("onnxruntime.dll"));
+        paths.push(exe.join("models").join("onnxruntime.dll"));
+        paths.push(exe.join("models").join("ocr").join("onnxruntime.dll"));
+        paths.push(exe.join("resources").join("ocr").join("onnxruntime.dll"));
+    }
     if let Some(mdir) = resolved_model_dir {
         paths.push(mdir.join("onnxruntime.dll"));
         if let Some(parent) = mdir.parent() {
@@ -317,12 +381,7 @@ fn candidate_runtime_dlls(
             }
         }
     }
-    let exe = exe_dir();
     if !exe.as_os_str().is_empty() {
-        paths.push(exe.join("onnxruntime.dll"));
-        paths.push(exe.join("models").join("onnxruntime.dll"));
-        paths.push(exe.join("models").join("ocr").join("onnxruntime.dll"));
-        paths.push(exe.join("resources").join("ocr").join("onnxruntime.dll"));
         if let Some(root) = workspace_root_from_exe(&exe) {
             paths.push(root.join(".runtime").join("ocr").join("onnxruntime.dll"));
         }
@@ -341,24 +400,19 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-fn has_non_empty_file(dir: &Path, filename: &str) -> bool {
-    dir.join(filename)
-        .metadata()
-        .is_ok_and(|m| m.is_file() && m.len() > 0)
-}
-
-fn is_model_complete_in(dir: &Path, spec: &ModelSetSpec, use_cls: bool) -> bool {
-    if !dir.is_dir() {
-        return false;
-    }
-    let pipeline = if use_cls {
-        PipelineConfig::full()
-    } else {
-        PipelineConfig::without_cls()
-    };
-    spec.assets_for_pipeline(pipeline)
-        .into_iter()
-        .all(|asset| has_non_empty_file(dir, asset.filename))
+fn has_flat_pack(dir: &Path, pack: &OcrModelPackSpec) -> bool {
+    // A shared detector, dictionary, or classifier alone doesn't identify a pack.
+    pack.spec.assets().iter().any(|asset| {
+        model_files::has_local_file(&dir.join(asset.filename))
+            && !OCR_MODEL_CATALOG.iter().any(|other| {
+                other.id != pack.id
+                    && other
+                        .spec
+                        .assets()
+                        .iter()
+                        .any(|a| a.filename == asset.filename)
+            })
+    })
 }
 
 fn model_disk_bytes_in(dir: &Path, spec: &ModelSetSpec) -> u64 {
@@ -377,47 +431,62 @@ fn inspect_model_pack(
     use_cls: bool,
 ) -> OcrModelInstallState {
     let managed_dir = model_pack_dir_in(storage_dir, pack.id);
-    if is_model_complete_in(&managed_dir, pack.spec, use_cls) {
-        let has_cls = has_non_empty_file(&managed_dir, pack.spec.cls.asset.filename);
-        let disk_bytes = model_disk_bytes_in(&managed_dir, pack.spec);
-        return OcrModelInstallState {
-            pack,
-            installed: true,
-            has_cls,
-            managed: true,
-            dir: managed_dir,
-            disk_bytes,
-        };
+    let mut local_dirs = Vec::new();
+    if pack
+        .spec
+        .assets()
+        .iter()
+        .any(|asset| model_files::has_local_file(&managed_dir.join(asset.filename)))
+    {
+        local_dirs.push(managed_dir.clone());
     }
-
-    for dir in fallback_dirs {
-        if is_model_complete_in(dir, pack.spec, use_cls) {
-            let has_cls = has_non_empty_file(dir, pack.spec.cls.asset.filename);
-            let disk_bytes = model_disk_bytes_in(dir, pack.spec);
-            return OcrModelInstallState {
-                pack,
-                installed: true,
-                has_cls,
-                managed: false,
-                dir: dir.clone(),
-                disk_bytes,
-            };
+    local_dirs.extend(
+        fallback_dirs
+            .iter()
+            .filter(|dir| has_flat_pack(dir, pack))
+            .cloned(),
+    );
+    let check = |dir: &Path| {
+        let mut missing = Vec::new();
+        let mut invalid = Vec::new();
+        let mut installed = true;
+        for asset in pack.spec.assets() {
+            let path = dir.join(asset.filename);
+            let required = use_cls || asset.kind != ModelAssetKind::Classification;
+            if !existing_asset_verified(&path, asset.sha256) {
+                if path.exists() {
+                    invalid.push(asset.filename);
+                } else if required {
+                    missing.push(asset.filename);
+                }
+                installed &= !required;
+            }
+        }
+        (installed, missing, invalid)
+    };
+    let mut best_dir = local_dirs.first().unwrap_or(&managed_dir);
+    let mut best = check(best_dir);
+    for dir in local_dirs.iter().skip(1) {
+        if best.0 {
+            break;
+        }
+        let candidate = check(dir);
+        if candidate.0
+            || (candidate.1.len() + candidate.2.len(), candidate.1.len())
+                < (best.1.len() + best.2.len(), best.1.len())
+        {
+            best_dir = dir;
+            best = candidate;
         }
     }
-
-    let managed_has_base = is_model_complete_in(&managed_dir, pack.spec, false);
-    let disk_bytes = if managed_has_base {
-        model_disk_bytes_in(&managed_dir, pack.spec)
-    } else {
-        0
-    };
     OcrModelInstallState {
         pack,
-        installed: false,
-        has_cls: has_non_empty_file(&managed_dir, pack.spec.cls.asset.filename),
-        managed: managed_has_base,
-        dir: managed_dir,
-        disk_bytes,
+        installed: best.0,
+        disk_bytes: model_disk_bytes_in(best_dir, pack.spec),
+        dir: best_dir.clone(),
+        missing: best.1,
+        invalid: best.2,
+        local_dirs,
     }
 }
 
@@ -449,86 +518,32 @@ fn inspect_status_with_options(
         .collect();
     let installed_count = models.iter().filter(|m| m.installed).count();
 
-    let preferred_pack = find_model_pack(selected_model);
-    let mut resolved_model_dir: Option<PathBuf> = None;
-    let mut resolved_spec: Option<&'static ModelSetSpec> = None;
-    let mut missing = Vec::new();
+    let preferred = find_model_pack(selected_model);
+    let active = match preferred {
+        Some(pack) => models.iter().find(|state| state.pack.id == pack.id),
+        None => models
+            .iter()
+            .find(|state| state.installed)
+            .or_else(|| models.iter().find(|state| !state.local_dirs.is_empty()))
+            .or_else(|| models.first()),
+    };
+    let resolved_model_dir = active
+        .filter(|state| !state.local_dirs.is_empty())
+        .map(|state| state.dir.clone());
+    let resolved_spec = active
+        .filter(|state| state.installed)
+        .map(|state| state.pack.spec);
+    let mut missing: Vec<String> = active
+        .into_iter()
+        .flat_map(|state| state.missing.iter().chain(state.invalid.iter()))
+        .map(|name| (*name).to_string())
+        .collect();
 
-    // 1. Honor explicitly selected model when installed.
-    if let Some(pref) = preferred_pack {
-        if let Some(state) = models.iter().find(|m| m.pack.id == pref.id && m.installed) {
-            resolved_model_dir = Some(state.dir.clone());
-            resolved_spec = Some(state.pack.spec);
-        } else if use_cls {
-            // If user selected this model and turned on orientation classifier, check if only cls is missing.
-            let managed_dir = model_pack_dir_in(&storage_dir, pref.id);
-            let base_dir = if is_model_complete_in(&managed_dir, pref.spec, false) {
-                Some(managed_dir)
-            } else {
-                fallback_dirs
-                    .iter()
-                    .find(|d| is_model_complete_in(d, pref.spec, false))
-                    .cloned()
-            };
-            if let Some(dir) = base_dir {
-                resolved_model_dir = Some(dir);
-                missing.push(pref.spec.cls.asset.filename.to_string());
-            }
-        }
-    }
-
-    // 2. Otherwise fall back to the highest-priority installed model.
-    if resolved_spec.is_none() && missing.is_empty() {
-        if let Some(state) = models.iter().find(|m| m.installed) {
-            resolved_model_dir = Some(state.dir.clone());
-            resolved_spec = Some(state.pack.spec);
-        }
-    }
-
-    // 3. If orientation classification is enabled and only the cls model is missing on any installed base model.
-    if resolved_spec.is_none() && missing.is_empty() && use_cls {
-        for pack in OCR_MODEL_CATALOG {
-            let managed_dir = model_pack_dir_in(&storage_dir, pack.id);
-            if is_model_complete_in(&managed_dir, pack.spec, false) {
-                resolved_model_dir = Some(managed_dir);
-                missing.push(pack.spec.cls.asset.filename.to_string());
-                break;
-            }
-            if let Some(dir) = fallback_dirs
-                .iter()
-                .find(|d| is_model_complete_in(d, pack.spec, false))
-            {
-                resolved_model_dir = Some(dir.clone());
-                missing.push(pack.spec.cls.asset.filename.to_string());
-                break;
-            }
-        }
-    }
-
-    // 4. Report missing files for the preferred or default model set.
-    if resolved_spec.is_none() && missing.is_empty() {
-        let target_spec = preferred_pack.map(|p| p.spec).unwrap_or(DEFAULT_MODEL_SET);
-        let pipeline = if use_cls {
-            PipelineConfig::full()
-        } else {
-            PipelineConfig::without_cls()
-        };
-        let target_dir = model_pack_dir_in(&storage_dir, target_spec.name);
-        for asset in target_spec.assets_for_pipeline(pipeline) {
-            if !has_non_empty_file(&target_dir, asset.filename)
-                && !has_non_empty_file(&storage_dir, asset.filename)
-            {
-                missing.push(asset.filename.to_string());
-            }
-        }
-    }
-
-    let dll_candidates = candidate_runtime_dlls(
+    let runtime_dll = resolve_runtime_dll(
         custom_dir,
         resolved_model_dir.as_deref().or(Some(&storage_dir)),
         data_dir,
     );
-    let runtime_dll = dll_candidates.into_iter().find(|p| p.is_file());
     if runtime_dll.is_none() {
         missing.push("onnxruntime.dll".to_string());
     }
@@ -620,29 +635,18 @@ fn file_sha256_hex(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-fn existing_asset_verified(path: &Path, expected_sha256: Option<&str>) -> bool {
-    let Ok(meta) = path.metadata() else {
-        return false;
-    };
-    if !meta.is_file() || meta.len() == 0 {
-        return false;
-    }
-    match expected_sha256 {
-        Some(expected) => file_sha256_hex(path)
-            .is_some_and(|actual| actual.eq_ignore_ascii_case(expected)),
-        None => true,
-    }
-}
-
-fn cleanup_part_files(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("part") {
-                let _ = std::fs::remove_file(path);
+fn existing_asset_verified(path: &Path, expected_sha256: Option<&'static str>) -> bool {
+    model_files::checked_file(
+        path,
+        expected_sha256.unwrap_or("onnx"),
+        || match expected_sha256 {
+            Some(expected) => {
+                file_sha256_hex(path).is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
             }
-        }
-    }
+            None => model_files::has_onnx_envelope(path),
+        },
+    )
+    .is_some()
 }
 
 /// Stream-download an OCR model pack into `<base_dir>/<model_id>/` with SHA-256 verification,
@@ -693,7 +697,6 @@ where
 
     for (idx, asset) in assets.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
-            cleanup_part_files(&target_dir);
             return Err(i18n::t("Download cancelled").into());
         }
 
@@ -733,18 +736,18 @@ where
             ));
         }
 
-        let remote_len = resp.content_length().unwrap_or(approx_sizes[idx]);
+        let content_len = resp.content_length();
+        let remote_len = content_len.unwrap_or(approx_sizes[idx]);
         let remaining_est: u64 = approx_sizes[idx + 1..].iter().sum();
         let effective_total = completed_bytes
             .saturating_add(remote_len)
             .saturating_add(remaining_est);
 
-        let part_path = target_dir.join(format!("{}.part", asset.filename));
-        let mut out = std::fs::File::create(&part_path).map_err(|e| {
+        let (pending, mut out) = PendingFile::create(&dest).map_err(|e| {
             i18n::tf(
                 "Unable to write temporary file {path}: {err}",
                 &[
-                    ("path", &part_path.display().to_string()),
+                    ("path", &model_files::part_path(&dest).display().to_string()),
                     ("err", &e.to_string()),
                 ],
             )
@@ -763,9 +766,6 @@ where
             )
         })? {
             if cancel.load(Ordering::Relaxed) {
-                drop(out);
-                let _ = std::fs::remove_file(&part_path);
-                cleanup_part_files(&target_dir);
                 return Err(i18n::t("Download cancelled").into());
             }
             out.write_all(&chunk).map_err(|e| {
@@ -800,9 +800,18 @@ where
         drop(out);
 
         if file_downloaded == 0 {
-            let _ = std::fs::remove_file(&part_path);
             return Err(i18n::tf(
                 "Downloaded file {file} is empty; please try again",
+                &[("file", asset.filename)],
+            ));
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err(i18n::t("Download cancelled").into());
+        }
+        if content_len.is_some_and(|expected| expected != file_downloaded) {
+            return Err(i18n::tf(
+                "Model file failed validation: {file}",
                 &[("file", asset.filename)],
             ));
         }
@@ -810,7 +819,6 @@ where
         if let Some(expected_sha) = asset.sha256 {
             let actual_sha = format!("{:x}", hasher.finalize());
             if !actual_sha.eq_ignore_ascii_case(expected_sha) {
-                let _ = std::fs::remove_file(&part_path);
                 return Err(i18n::tf(
                     "Checksum verification failed for {file}; try switching the download mirror in Settings",
                     &[("file", asset.filename)],
@@ -818,10 +826,13 @@ where
             }
         }
 
-        if dest.exists() {
-            let _ = std::fs::remove_file(&dest);
+        if asset.sha256.is_none() && !existing_asset_verified(pending.path(), asset.sha256) {
+            return Err(i18n::tf(
+                "Model file failed validation: {file}",
+                &[("file", asset.filename)],
+            ));
         }
-        std::fs::rename(&part_path, &dest).map_err(|e| {
+        pending.install(&dest).map_err(|e| {
             i18n::tf(
                 "Failed to save file {file}: {err}",
                 &[("file", asset.filename), ("err", &e.to_string())],
@@ -842,29 +853,47 @@ where
     Ok(target_dir)
 }
 
-/// Evict the cached OCR engine session if it uses `model_id`.
-pub fn evict_cached_model(model_id: &str) {
-    let mut guard = ENGINE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+/// Delete the selected pack while retaining files shared with other flat packs.
+pub fn remove_model_pack(
+    model_id: &str,
+    base_dir: &Path,
+    local_dirs: &[PathBuf],
+) -> Result<(), String> {
+    let pack = find_model_pack(model_id)
+        .ok_or_else(|| i18n::tf("OCR model pack not found: {id}", &[("id", model_id)]))?;
+    let managed_dir = model_pack_dir_in(base_dir, pack.id);
+    let mut guard = ENGINE_CACHE.lock().unwrap_or_else(|err| err.into_inner());
     if guard
         .as_ref()
-        .is_some_and(|cached| cached.key.model_set_name == model_id)
+        .is_some_and(|cached| cached.key.model_set_name == pack.id)
     {
         *guard = None;
     }
-}
-
-/// Delete a downloaded OCR model pack directory and evict any cached ONNX session.
-pub fn remove_model_pack(model_id: &str, base_dir: &Path) -> Result<(), String> {
-    let pack = find_model_pack(model_id)
-        .ok_or_else(|| i18n::tf("OCR model pack not found: {id}", &[("id", model_id)]))?;
-    evict_cached_model(pack.id);
-    let dir = model_pack_dir_in(base_dir, pack.id);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| {
+    for dir in local_dirs {
+        let remove = || -> std::io::Result<()> {
+            for asset in pack.spec.assets() {
+                let used_by_other_pack = dir != &managed_dir
+                    && OCR_MODEL_CATALOG.iter().any(|other| {
+                        other.id != pack.id
+                            && other
+                                .spec
+                                .assets()
+                                .iter()
+                                .any(|a| a.filename == asset.filename)
+                            && has_flat_pack(dir, other)
+                    });
+                if !used_by_other_pack {
+                    model_files::remove_model_file(&dir.join(asset.filename))?;
+                }
+            }
+            if dir == &managed_dir {
+                model_files::remove_empty_dir(dir)?;
+            }
+            Ok(())
+        };
+        remove().map_err(|e| {
             i18n::tf(
-                "Failed to remove OCR model directory ({path}): {err}",
+                "Failed to delete model files ({path}): {err}",
                 &[
                     ("path", &dir.display().to_string()),
                     ("err", &e.to_string()),
@@ -1346,6 +1375,10 @@ fn run_engine_lines(
     let selected_model = local["model"].as_str().unwrap_or("");
     let use_cls = local["useCls"].as_bool().unwrap_or(false);
 
+    let mut guard = ENGINE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let status = inspect_status_with_options(custom_dir, selected_model, use_cls, data_dir);
     if !status.ready {
         if status.runtime_dll.is_none() {
@@ -1355,7 +1388,7 @@ fn run_engine_lines(
             .into());
         }
         return Err(i18n::tf(
-            "Local RapidOCR model is not ready, missing: {missing}. Download an OCR model in Settings -> Text & Translation -> Text Recognition (OCR) ({dir})",
+            "Local OCR files are unavailable: {missing}. Download or repair the model in Settings -> Text & Translation -> Text Recognition (OCR) ({dir})",
             &[
                 ("missing", &status.missing.join(", ")),
                 ("dir", &status.storage_dir.display().to_string()),
@@ -1382,21 +1415,9 @@ fn run_engine_lines(
 
     let rgb = rgba_to_rgb(image);
 
-    let mut guard = ENGINE_CACHE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
     let needs_rebuild = guard.as_ref().is_none_or(|cached| cached.key != key);
     if needs_rebuild {
-        let runtime = OcrRuntime::load_from(&key.dll_path).map_err(|e| {
-            i18n::tf(
-                "Unable to load ONNX Runtime ({path}): {err}",
-                &[
-                    ("path", &key.dll_path.display().to_string()),
-                    ("err", &e.to_string()),
-                ],
-            )
-        })?;
+        let runtime = load_shared_runtime(&key.dll_path)?;
         let mut cfg = spec.config(&key.model_dir);
         cfg.pipeline = if use_cls {
             PipelineConfig::full()
@@ -1471,6 +1492,7 @@ pub fn build_test_image() -> Rgba {
             tool: Tool::Text,
             points: vec![Point { x: 32.0, y: 28.0 }],
             color: "#111111".into(),
+            fill_color: None,
             width: 3.0,
             text: Some("SnapDock Local OCR Test".into()),
             number: None,
@@ -1485,6 +1507,7 @@ pub fn build_test_image() -> Rgba {
             tool: Tool::Text,
             points: vec![Point { x: 32.0, y: 88.0 }],
             color: "#111111".into(),
+            fill_color: None,
             width: 3.0,
             text: Some("Hello RapidOCR 2026".into()),
             number: None,
@@ -1662,44 +1685,71 @@ mod tests {
             .iter()
             .any(|f| f == "ppocrv5_dict.txt"));
 
-        // Write stub files to verify flat asset discovery.
-        for name in [
-            "ch_PP-OCRv5_det_mobile.onnx",
-            "ch_PP-OCRv5_rec_mobile.onnx",
-            "ppocrv5_dict.txt",
-            "onnxruntime.dll",
-        ] {
-            std::fs::write(tmp.join(name), b"stub").unwrap();
-        }
-        let status_ready = inspect_status_with_options(tmp.to_str().unwrap(), "", false, &tmp);
-        assert!(status_ready.ready);
-        assert_eq!(status_ready.model_set_name, Some("ppocrv5-ch-mobile"));
-        assert!(status_ready.missing.is_empty());
+        // Nonempty junk must stay unavailable while remaining removable.
+        let pack = find_model_pack("ppocrv5-ch-mobile").unwrap();
+        let rec = tmp.join(pack.spec.rec.asset.filename);
+        let shared_dict = tmp.join(pack.spec.rec.dict.filename);
+        let other_rec = tmp.join(PPOCRV5_CH_SERVER.rec.asset.filename);
+        std::fs::write(&rec, b"invalid model").unwrap();
+        std::fs::write(&shared_dict, b"shared dictionary").unwrap();
+        std::fs::write(&other_rec, b"other model").unwrap();
 
-        // Write a managed subdirectory pack (ppocrv6-small) and select it explicitly.
-        let v6_dir = model_pack_dir_in(&tmp, "ppocrv6-small");
-        std::fs::create_dir_all(&v6_dir).unwrap();
-        for asset in PPOCRV6_SMALL.assets() {
-            std::fs::write(v6_dir.join(asset.filename), b"stub-v6").unwrap();
-        }
-        let status_v6 =
-            inspect_status_with_options(tmp.to_str().unwrap(), "ppocrv6-small", true, &tmp);
-        assert!(status_v6.ready);
-        assert_eq!(status_v6.model_set_name, Some("ppocrv6-small"));
-        assert_eq!(status_v6.model_dir.as_deref(), Some(v6_dir.as_path()));
-        let v6_state = status_v6
+        let dir = model_pack_dir_in(&tmp, pack.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = model_files::part_path(&dir.join(pack.spec.det.asset.filename));
+        std::fs::write(&part, b"partial").unwrap();
+        let status = inspect_status_with_options(tmp.to_str().unwrap(), pack.id, false, &tmp);
+        let state = status
             .models
             .iter()
-            .find(|m| m.pack.id == "ppocrv6-small")
+            .find(|state| state.pack.id == pack.id)
             .unwrap();
-        assert!(v6_state.installed);
-        assert!(v6_state.managed);
-        assert!(v6_state.has_cls);
+        assert!(!status.ready);
+        assert!(!state.installed);
+        assert!(state.invalid.contains(&pack.spec.rec.asset.filename));
+        assert!(state.missing.contains(&pack.spec.det.asset.filename));
+        assert_eq!(state.local_dirs, vec![dir.clone(), tmp.clone()]);
 
-        // Removing the managed pack deletes its directory cleanly.
-        remove_model_pack("ppocrv6-small", &tmp).unwrap();
-        assert!(!v6_dir.exists());
+        remove_model_pack(pack.id, &tmp, &state.local_dirs).unwrap();
+        assert!(!rec.exists());
+        assert!(!dir.exists());
+        assert!(shared_dict.exists());
+        assert!(other_rec.exists());
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn candidate_runtime_dlls_prefers_exe_dir_before_fallback_model_dir() {
+        let model_dir = PathBuf::from(r"C:\fallback\ocr\models");
+        let data_dir = PathBuf::from(r"C:\data");
+        let candidates = candidate_runtime_dlls("", Some(&model_dir), &data_dir);
+        let exe_dll = exe_dir().join("onnxruntime.dll");
+        let model_dll = model_dir.join("onnxruntime.dll");
+        let exe_idx = candidates.iter().position(|p| p == &exe_dll).unwrap();
+        let model_idx = candidates.iter().position(|p| p == &model_dll).unwrap();
+        assert!(exe_idx < model_idx);
+    }
+
+    #[test]
+    fn load_shared_runtime_reuses_initialized_library_across_different_paths() {
+        let Some(dll_a) = resolve_runtime_dll("", None, &std::env::temp_dir()) else {
+            return;
+        };
+        let _rt1 = load_shared_runtime(&dll_a).expect("first runtime load should succeed");
+        let tmp = std::env::temp_dir().join(format!(
+            "snapdock-ort-reuse-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dll_b = tmp.join("onnxruntime.dll");
+        std::fs::write(&dll_b, b"stub").unwrap();
+        let _rt2 = load_shared_runtime(&dll_b)
+            .expect("second runtime load with another path should reuse initialized runtime");
+        assert_eq!(
+            resolve_runtime_dll(tmp.to_str().unwrap(), None, &tmp).as_deref(),
+            Some(dll_a.as_path())
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

@@ -14,15 +14,23 @@ pub mod settings_window;
 pub mod toast;
 
 use crate::i18n;
-use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Stroke, TextureHandle, Vec2, Visuals};
+use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, TextureHandle, Vec2, Visuals};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 pub const DANGER: Color32 = Color32::from_rgb(0xd9, 0x48, 0x48);
 
 const THEME_ACCENT_KEY: &str = "snapdock_theme_accent";
+const FONT_FACE_KEY: &str = "snapdock_font_face";
+const FONT_EFFECTS_KEY: &str = "snapdock_font_effects";
+
+pub const DEFAULT_FONT_SIZE: i64 = 13;
+pub const MIN_FONT_SIZE: i64 = 10;
+pub const MAX_FONT_SIZE: i64 = 22;
 
 /// Accent color presets that combine freely with light, dark, or system theme mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,47 +401,664 @@ impl GifPlayer {
     }
 }
 
-/// Cache Windows CJK font definitions once with shared `Arc<FontData>` to avoid re-reading disk or copying ~20MB per window.
-fn cached_font_definitions() -> &'static FontDefinitions {
-    static FONTS: OnceLock<FontDefinitions> = OnceLock::new();
-    FONTS.get_or_init(|| {
-        let mut fonts = FontDefinitions::default();
-        for path in [
+/// Window clear color matching the themed pin toolbar surface.
+pub fn pin_toolbar_clear_color(dark: bool, accent: ThemeAccent) -> wgpu::Color {
+    let c = if dark {
+        accent.palette().dark_window
+    } else {
+        Color32::from_rgb(0xfc, 0xfd, 0xfd)
+    };
+    wgpu::Color {
+        r: c.r() as f64 / 255.0,
+        g: c.g() as f64 / 255.0,
+        b: c.b() as f64 / 255.0,
+        a: 1.0,
+    }
+}
+
+/// UI font preferences stored under `general`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FontSetting {
+    /// Canonical family name (`""` means System Default).
+    pub family: String,
+    /// Base body font size in logical points (`10..=22`).
+    pub size: i64,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl Default for FontSetting {
+    fn default() -> Self {
+        Self {
+            family: String::new(),
+            size: DEFAULT_FONT_SIZE,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
+/// Synthetic glyph effects applied at render time when the selected system font
+/// does not ship a dedicated Bold or Italic font file (common for Windows CJK fonts).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FontEffects {
+    pub synthetic_bold: bool,
+    pub synthetic_italic: bool,
+}
+
+/// Discovered Windows system font family and its available style files.
+#[derive(Clone, Debug)]
+pub struct SystemFontFamily {
+    pub name: String,
+    pub zh_name: Option<&'static str>,
+    pub regular: Option<PathBuf>,
+    pub bold: Option<PathBuf>,
+    pub italic: Option<PathBuf>,
+    pub bold_italic: Option<PathBuf>,
+}
+
+impl SystemFontFamily {
+    pub fn display_label(&self) -> String {
+        if let Some(zh) = self.zh_name {
+            if i18n::is_zh_cn() {
+                return format!("{} ({})", zh, self.name);
+            }
+        }
+        self.name.clone()
+    }
+
+    pub fn matches_query(&self, query: &str) -> bool {
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return true;
+        }
+        if self.name.to_ascii_lowercase().contains(&q) {
+            return true;
+        }
+        if let Some(zh) = self.zh_name {
+            if zh.to_lowercase().contains(&q) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn zh_font_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "Microsoft YaHei" => Some("微软雅黑"),
+        "DengXian" => Some("等线"),
+        "SimSun" => Some("宋体"),
+        "NSimSun" => Some("新宋体"),
+        "SimHei" => Some("黑体"),
+        "KaiTi" => Some("楷体"),
+        "FangSong" => Some("仿宋"),
+        "Microsoft JhengHei" => Some("微软正黑体"),
+        "YouYuan" => Some("幼圆"),
+        "LiSu" => Some("隶书"),
+        "STSong" => Some("华文宋体"),
+        "STKaiti" => Some("华文楷体"),
+        "STFangsong" => Some("华文仿宋"),
+        "STXihei" => Some("华文细黑"),
+        "STZhongsong" => Some("华文中宋"),
+        "STXingkai" => Some("华文行楷"),
+        "STLiti" => Some("华文隶书"),
+        "STXinwei" => Some("华文新魏"),
+        "STHupo" => Some("华文琥珀"),
+        "STCaiyun" => Some("华文彩云"),
+        "FZShuTi" => Some("方正舒体"),
+        "FZYaoTi" => Some("方正姚体"),
+        _ => None,
+    }
+}
+
+fn is_excluded_symbol_font(family: &str) -> bool {
+    let lower = family.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "webdings"
+            | "wingdings"
+            | "wingdings 2"
+            | "wingdings 3"
+            | "symbol"
+            | "marlett"
+            | "segoe mdl2 assets"
+            | "segoe fluent icons"
+            | "segoe ui symbol"
+            | "segoe ui emoji"
+            | "hololens mdl2 assets"
+            | "mt extra"
+            | "bookshelf symbol 7"
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParsedFontStyle {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+    SecondaryWeight,
+}
+
+fn parse_registry_font_name(raw: &str) -> Option<(String, ParsedFontStyle)> {
+    let mut name = raw.trim();
+    for suffix in ["(TrueType)", "(OpenType)", "(All res)"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            name = stripped.trim();
+        }
+    }
+    // TTC collections list multiple names joined by ` & `; take the primary face name.
+    if let Some((first, _)) = name.split_once(" & ") {
+        name = first.trim();
+    }
+    if name.is_empty() {
+        return None;
+    }
+
+    let lower = name.to_ascii_lowercase();
+    for (suf, style) in [
+        (" bold italic", ParsedFontStyle::BoldItalic),
+        (" bold oblique", ParsedFontStyle::BoldItalic),
+        (" bold", ParsedFontStyle::Bold),
+        (" italic", ParsedFontStyle::Italic),
+        (" oblique", ParsedFontStyle::Italic),
+        (" regular", ParsedFontStyle::Regular),
+        (" normal", ParsedFontStyle::Regular),
+    ] {
+        if lower.ends_with(suf) {
+            let base = name[..name.len() - suf.len()].trim();
+            if !base.is_empty() {
+                // Skip secondary weights combined with italic/bold like "Segoe UI Light Italic"
+                let base_lower = base.to_ascii_lowercase();
+                if matches_secondary_weight_suffix(&base_lower) {
+                    return Some((base.to_string(), ParsedFontStyle::SecondaryWeight));
+                }
+                return Some((base.to_string(), style));
+            }
+        }
+    }
+
+    if matches_secondary_weight_suffix(&lower) {
+        return Some((name.to_string(), ParsedFontStyle::SecondaryWeight));
+    }
+
+    Some((name.to_string(), ParsedFontStyle::Regular))
+}
+
+fn matches_secondary_weight_suffix(lower: &str) -> bool {
+    [
+        " light",
+        " semilight",
+        " extralight",
+        " thin",
+        " semibold",
+        " demibold",
+        " black",
+        " heavy",
+        " medium",
+        " ultrabold",
+        " extrabold",
+        " condensed",
+        " narrow",
+    ]
+    .iter()
+    .any(|s| lower.ends_with(s))
+}
+
+const POPULAR_FONT_ORDER: &[&str] = &[
+    "Microsoft YaHei",
+    "DengXian",
+    "SimSun",
+    "SimHei",
+    "KaiTi",
+    "FangSong",
+    "Microsoft JhengHei",
+    "Segoe UI",
+    "Arial",
+    "Consolas",
+    "Calibri",
+    "Times New Roman",
+];
+
+/// Cached list of installed Windows system font families (sorted with common CJK & UI fonts first).
+pub fn system_font_families() -> &'static [SystemFontFamily] {
+    static CATALOG: OnceLock<Vec<SystemFontFamily>> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let mut by_key: HashMap<String, SystemFontFamily> = HashMap::new();
+        for (reg_name, path) in crate::native::list_system_font_entries() {
+            let Some((family, style)) = parse_registry_font_name(&reg_name) else {
+                continue;
+            };
+            if style == ParsedFontStyle::SecondaryWeight || is_excluded_symbol_font(&family) {
+                continue;
+            }
+            let key = family.to_ascii_lowercase();
+            let entry = by_key.entry(key).or_insert_with(|| SystemFontFamily {
+                zh_name: zh_font_alias(&family),
+                name: family.clone(),
+                regular: None,
+                bold: None,
+                italic: None,
+                bold_italic: None,
+            });
+            match style {
+                ParsedFontStyle::Regular => {
+                    if entry.regular.is_none() {
+                        entry.regular = Some(path);
+                    }
+                }
+                ParsedFontStyle::Bold => {
+                    if entry.bold.is_none() {
+                        entry.bold = Some(path);
+                    }
+                }
+                ParsedFontStyle::Italic => {
+                    if entry.italic.is_none() {
+                        entry.italic = Some(path);
+                    }
+                }
+                ParsedFontStyle::BoldItalic => {
+                    if entry.bold_italic.is_none() {
+                        entry.bold_italic = Some(path);
+                    }
+                }
+                ParsedFontStyle::SecondaryWeight => {}
+            }
+        }
+
+        let mut list: Vec<SystemFontFamily> = by_key
+            .into_values()
+            .filter(|f| {
+                f.regular.is_some()
+                    || f.bold.is_some()
+                    || f.italic.is_some()
+                    || f.bold_italic.is_some()
+            })
+            .collect();
+
+        list.sort_by(|a, b| {
+            let pa = POPULAR_FONT_ORDER
+                .iter()
+                .position(|&p| p.eq_ignore_ascii_case(&a.name));
+            let pb = POPULAR_FONT_ORDER
+                .iter()
+                .position(|&p| p.eq_ignore_ascii_case(&b.name));
+            match (pa, pb) {
+                (Some(ia), Some(ib)) => ia.cmp(&ib),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a
+                    .name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase()),
+            }
+        });
+        list
+    })
+}
+
+pub fn find_system_font(family: &str) -> Option<&'static SystemFontFamily> {
+    let trimmed = family.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    system_font_families()
+        .iter()
+        .find(|f| f.name.eq_ignore_ascii_case(trimmed))
+}
+
+fn default_cjk_fallback_path(bold: bool) -> Option<PathBuf> {
+    let candidates: &[&str] = if bold {
+        &[
+            "C:\\Windows\\Fonts\\msyhbd.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\simhei.ttf",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+            "C:\\Windows\\Fonts\\Dengb.ttf",
+            "C:\\Windows\\Fonts\\Deng.ttf",
+        ]
+    } else {
+        &[
             "C:\\Windows\\Fonts\\msyh.ttc",
             "C:\\Windows\\Fonts\\simhei.ttf",
             "C:\\Windows\\Fonts\\simsun.ttc",
             "C:\\Windows\\Fonts\\Deng.ttf",
-        ] {
-            if let Ok(bytes) = std::fs::read(path) {
-                fonts.font_data.insert(
-                    "cjk".to_owned(),
-                    Arc::new(FontData::from_owned(bytes)),
-                );
+        ]
+    };
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
+}
+
+fn load_font_data_cached(path: &Path) -> Option<Arc<FontData>> {
+    static BYTES_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<FontData>>>> = OnceLock::new();
+    let cache = BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(existing) = cache.lock().unwrap().get(path).cloned() {
+        return Some(existing);
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let data = Arc::new(FontData::from_owned(bytes));
+    cache
+        .lock()
+        .unwrap()
+        .insert(path.to_path_buf(), data.clone());
+    Some(data)
+}
+
+fn pick_family_file(
+    fam: &SystemFontFamily,
+    bold: bool,
+    italic: bool,
+) -> Option<(&Path, FontEffects)> {
+    match (bold, italic) {
+        (true, true) => {
+            if let Some(p) = fam.bold_italic.as_deref() {
+                Some((
+                    p,
+                    FontEffects {
+                        synthetic_bold: false,
+                        synthetic_italic: false,
+                    },
+                ))
+            } else if let Some(p) = fam.bold.as_deref() {
+                Some((
+                    p,
+                    FontEffects {
+                        synthetic_bold: false,
+                        synthetic_italic: true,
+                    },
+                ))
+            } else if let Some(p) = fam.italic.as_deref() {
+                Some((
+                    p,
+                    FontEffects {
+                        synthetic_bold: true,
+                        synthetic_italic: false,
+                    },
+                ))
+            } else {
+                fam.regular.as_deref().map(|p| {
+                    (
+                        p,
+                        FontEffects {
+                            synthetic_bold: true,
+                            synthetic_italic: true,
+                        },
+                    )
+                })
+            }
+        }
+        (true, false) => {
+            if let Some(p) = fam.bold.as_deref() {
+                Some((
+                    p,
+                    FontEffects {
+                        synthetic_bold: false,
+                        synthetic_italic: false,
+                    },
+                ))
+            } else {
+                fam.regular.as_deref().map(|p| {
+                    (
+                        p,
+                        FontEffects {
+                            synthetic_bold: true,
+                            synthetic_italic: false,
+                        },
+                    )
+                })
+            }
+        }
+        (false, true) => {
+            if let Some(p) = fam.italic.as_deref() {
+                Some((
+                    p,
+                    FontEffects {
+                        synthetic_bold: false,
+                        synthetic_italic: false,
+                    },
+                ))
+            } else {
+                fam.regular.as_deref().map(|p| {
+                    (
+                        p,
+                        FontEffects {
+                            synthetic_bold: false,
+                            synthetic_italic: true,
+                        },
+                    )
+                })
+            }
+        }
+        (false, false) => fam
+            .regular
+            .as_deref()
+            .or(fam.bold.as_deref())
+            .or(fam.italic.as_deref())
+            .or(fam.bold_italic.as_deref())
+            .map(|p| (p, FontEffects::default())),
+    }
+}
+
+fn build_font_definitions(
+    family: &str,
+    bold: bool,
+    italic: bool,
+) -> (FontDefinitions, FontEffects) {
+    let key = (family.trim().to_ascii_lowercase(), bold, italic);
+    static DEFS_CACHE: OnceLock<Mutex<HashMap<(String, bool, bool), (FontDefinitions, FontEffects)>>> =
+        OnceLock::new();
+    let cache = DEFS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(&key).cloned() {
+        return hit;
+    }
+
+    let mut fonts = FontDefinitions::default();
+    let mut effects = FontEffects::default();
+
+    let resolved_family = if family.trim().is_empty() {
+        find_system_font("Microsoft YaHei")
+            .or_else(|| find_system_font("DengXian"))
+            .or_else(|| find_system_font("SimHei"))
+            .or_else(|| find_system_font("SimSun"))
+            .or_else(|| system_font_families().first())
+    } else {
+        find_system_font(family)
+            .or_else(|| find_system_font("Microsoft YaHei"))
+            .or_else(|| system_font_families().first())
+    };
+
+    let mut primary_path: Option<PathBuf> = None;
+    if let Some(fam) = resolved_family {
+        if let Some((path, eff)) = pick_family_file(fam, bold, italic) {
+            if let Some(data) = load_font_data_cached(path) {
+                fonts.font_data.insert("user_primary".to_owned(), data);
                 fonts
                     .families
                     .entry(FontFamily::Proportional)
                     .or_default()
-                    .insert(0, "cjk".to_owned());
+                    .insert(0, "user_primary".to_owned());
                 fonts
                     .families
                     .entry(FontFamily::Monospace)
                     .or_default()
-                    .push("cjk".to_owned());
-                break;
+                    .insert(0, "user_primary".to_owned());
+                effects = eff;
+                primary_path = Some(path.to_path_buf());
             }
         }
-        fonts
-    })
+    }
+
+    // Always append a CJK fallback font after the primary font (unless already loaded as primary)
+    // so picking a Latin-only font like Arial or Consolas still renders Chinese text cleanly.
+    if let Some(cjk_path) = default_cjk_fallback_path(bold) {
+        let same_as_primary = primary_path
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(cjk_path.as_os_str()));
+        if !same_as_primary {
+            if let Some(data) = load_font_data_cached(&cjk_path) {
+                fonts.font_data.insert("cjk_fallback".to_owned(), data);
+                let prop = fonts.families.entry(FontFamily::Proportional).or_default();
+                let insert_pos = usize::from(primary_path.is_some()).min(prop.len());
+                prop.insert(insert_pos, "cjk_fallback".to_owned());
+                let mono = fonts.families.entry(FontFamily::Monospace).or_default();
+                mono.push("cjk_fallback".to_owned());
+                if primary_path.is_none() {
+                    effects = FontEffects {
+                        synthetic_bold: bold && !cjk_path.to_string_lossy().to_ascii_lowercase().contains("bd"),
+                        synthetic_italic: italic,
+                    };
+                }
+            }
+        }
+    }
+
+    let result = (fonts, effects);
+    cache.lock().unwrap().insert(key, result.clone());
+    result
 }
 
-/// Warm the cached system CJK font file on a background thread so the first window opens without disk I/O.
+static ACTIVE_FONT: OnceLock<RwLock<FontSetting>> = OnceLock::new();
+
+fn active_font_lock() -> &'static RwLock<FontSetting> {
+    ACTIVE_FONT.get_or_init(|| RwLock::new(FontSetting::default()))
+}
+
+pub fn set_active_font(font: FontSetting) {
+    *active_font_lock().write().unwrap() = font;
+}
+
+pub fn active_font() -> FontSetting {
+    active_font_lock().read().unwrap().clone()
+}
+
+pub fn theme_font(settings: &Value) -> FontSetting {
+    let g = &settings["general"];
+    FontSetting {
+        family: g["fontFamily"].as_str().unwrap_or("").trim().to_string(),
+        size: g["fontSize"]
+            .as_i64()
+            .unwrap_or(DEFAULT_FONT_SIZE)
+            .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE),
+        bold: g["fontBold"].as_bool().unwrap_or(false),
+        italic: g["fontItalic"].as_bool().unwrap_or(false),
+    }
+}
+
+/// Warm the system font catalog and default font file on a background thread so the first window opens without disk I/O.
 pub fn preload_fonts() {
-    let _ = cached_font_definitions();
+    let _ = system_font_families();
+    let f = active_font();
+    let _ = build_font_definitions(&f.family, f.bold, f.italic);
 }
 
-/// Install Windows CJK fallback fonts on each `egui::Context` (zero-copy `Arc<FontData>` clone).
+/// Install the currently active UI font on each newly created `egui::Context` (zero-copy `Arc<FontData>` clone).
 pub fn configure_egui(ctx: &egui::Context) {
-    ctx.set_fonts(cached_font_definitions().clone());
+    let font = active_font();
+    apply_font(ctx, &font);
+}
+
+/// Apply configured font family, font size, bold, and italic settings to an `egui::Context`.
+pub fn apply_font(ctx: &egui::Context, font: &FontSetting) {
+    let face_key = (font.family.trim().to_ascii_lowercase(), font.bold, font.italic);
+    let prev_face =
+        ctx.data(|d| d.get_temp::<(String, bool, bool)>(egui::Id::new(FONT_FACE_KEY)));
+    if prev_face.as_ref() != Some(&face_key) {
+        let (defs, effects) = build_font_definitions(&font.family, font.bold, font.italic);
+        ctx.set_fonts(defs);
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new(FONT_FACE_KEY), face_key);
+            d.insert_temp(egui::Id::new(FONT_EFFECTS_KEY), effects);
+        });
+    }
+
+    let body = font.size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE) as f32;
+    let text_styles: BTreeMap<TextStyle, FontId> = [
+        (TextStyle::Small, FontId::new((body * 0.78).max(8.5), FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(body, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(body, FontFamily::Proportional)),
+        (TextStyle::Heading, FontId::new((body * 1.38).max(14.0), FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new((body - 0.5).max(9.0), FontFamily::Monospace)),
+    ]
+    .into();
+    ctx.all_styles_mut(move |style| {
+        style.text_styles = text_styles.clone();
+    });
+}
+
+fn transform_text_shape(shape: &mut egui::Shape, effects: FontEffects) {
+    match shape {
+        egui::Shape::Text(ts) => {
+            let galley = Arc::make_mut(&mut ts.galley);
+            for row in &mut galley.rows {
+                let range = row.visuals.glyph_vertex_range.clone();
+                if range.is_empty() || range.end > row.visuals.mesh.vertices.len() {
+                    continue;
+                }
+                if effects.synthetic_italic {
+                    for quad in row.visuals.mesh.vertices[range.clone()].chunks_exact_mut(4) {
+                        // Skip quads already slanted by RichText::italics().
+                        if (quad[0].pos.x - quad[2].pos.x).abs() < 0.01 {
+                            let h = (quad[2].pos.y - quad[0].pos.y).max(0.0);
+                            let slant = h * 0.22;
+                            quad[0].pos.x += slant;
+                            quad[1].pos.x += slant;
+                        }
+                    }
+                    row.visuals.mesh_bounds.max.x += row.rect.height() * 0.25;
+                }
+                if effects.synthetic_bold {
+                    let orig_verts: Vec<_> = row.visuals.mesh.vertices[range.clone()].to_vec();
+                    let quad_count = orig_verts.len() / 4;
+                    if quad_count > 0 {
+                        row.visuals.mesh.vertices.reserve(quad_count * 4);
+                        row.visuals.mesh.indices.reserve(quad_count * 6);
+                        for quad in orig_verts.chunks_exact(4) {
+                            let base = row.visuals.mesh.vertices.len() as u32;
+                            for mut v in quad.iter().copied() {
+                                v.pos.x += 0.65;
+                                row.visuals.mesh.vertices.push(v);
+                            }
+                            row.visuals.mesh.indices.extend_from_slice(&[
+                                base,
+                                base + 1,
+                                base + 2,
+                                base + 2,
+                                base + 1,
+                                base + 3,
+                            ]);
+                        }
+                        row.visuals.mesh_bounds.max.x += 0.65;
+                    }
+                }
+            }
+        }
+        egui::Shape::Vec(shapes) => {
+            for s in shapes {
+                transform_text_shape(s, effects);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply synthetic italic slant and/or faux bold weight to rendered text shapes when the active
+/// system font lacks a native bold/italic face. Zero cost when native faces or Regular are active.
+pub fn apply_font_effects_to_shapes(
+    ctx: &egui::Context,
+    shapes: &mut [egui::epaint::ClippedShape],
+) {
+    let effects = ctx
+        .data(|d| d.get_temp::<FontEffects>(egui::Id::new(FONT_EFFECTS_KEY)))
+        .unwrap_or_default();
+    if !effects.synthetic_bold && !effects.synthetic_italic {
+        return;
+    }
+    for clipped in shapes.iter_mut() {
+        transform_text_shape(&mut clipped.shape, effects);
+    }
 }
 
 /// Common UI text color presets (paired with Auto mode).
@@ -824,6 +1449,175 @@ pub fn searchable_language_picker(
     picked
 }
 
+/// Searchable system font dropdown fetched from Windows installed fonts.
+/// Returns `Some(selected_family)` (`""` for System Default) when the user picks a font.
+pub fn searchable_font_picker(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    current_family: &str,
+    width: f32,
+    search_query: &mut String,
+) -> Option<String> {
+    let popup_id = ui.make_persistent_id(egui::Id::new(id_salt));
+    let is_open = ui.memory(|m| m.is_popup_open(popup_id));
+
+    let display_text = if current_family.trim().is_empty() {
+        i18n::t("System Default").to_string()
+    } else if let Some(fam) = find_system_font(current_family) {
+        fam.display_label()
+    } else {
+        current_family.to_string()
+    };
+
+    let button_size = Vec2::new(width, 28.0);
+    let (rect, resp) = ui.allocate_exact_size(button_size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.visuals();
+        let (fill, stroke, fg) = if is_open || resp.hovered() {
+            (
+                visuals.widgets.hovered.bg_fill,
+                Stroke::new(1.0_f32, ctx_palette(ui.ctx()).accent),
+                visuals.strong_text_color(),
+            )
+        } else {
+            (
+                visuals.widgets.inactive.bg_fill,
+                visuals.widgets.inactive.bg_stroke,
+                visuals.text_color(),
+            )
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(7),
+            fill,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+
+        let arrow_size = 11.0_f32;
+        let pad_x = 9.0_f32;
+        let max_text_w = (rect.width() - pad_x * 2.0 - arrow_size - 4.0).max(20.0);
+        let font_id = egui::TextStyle::Body.resolve(ui.style());
+        let mut job = egui::text::LayoutJob::single_section(
+            display_text,
+            egui::TextFormat::simple(font_id, fg),
+        );
+        job.wrap = egui::text::TextWrapping {
+            max_width: max_text_w,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        };
+        let galley = ui.painter().layout_job(job);
+        let text_pos = egui::Pos2::new(rect.min.x + pad_x, rect.center().y - galley.size().y * 0.5);
+        ui.painter().galley(text_pos, galley, fg);
+
+        let arrow_rect = egui::Rect::from_center_size(
+            egui::Pos2::new(rect.max.x - pad_x - arrow_size * 0.5, rect.center().y),
+            Vec2::splat(arrow_size),
+        );
+        icons::paint(
+            ui.painter(),
+            arrow_rect,
+            if is_open {
+                icons::Icon::ChevronUp
+            } else {
+                icons::Icon::ChevronDown
+            },
+            fg,
+        );
+    }
+
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+        if !is_open {
+            search_query.clear();
+        }
+    }
+
+    let mut picked: Option<String> = None;
+    egui::popup::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            let popup_w = width.max(240.0);
+            ui.set_min_width(popup_w);
+            ui.set_max_width(popup_w + 40.0);
+
+            ui.horizontal(|ui| {
+                let clear_w = if search_query.is_empty() { 0.0 } else { 26.0 };
+                let edit_resp = ui.add(
+                    egui::TextEdit::singleline(search_query)
+                        .desired_width((popup_w - clear_w - 6.0).max(120.0))
+                        .hint_text(i18n::t("Search system font...")),
+                );
+                if !is_open {
+                    edit_resp.request_focus();
+                }
+                if !search_query.is_empty()
+                    && icons::small_icon_button(ui, icons::Icon::Close)
+                        .on_hover_text(i18n::t("Clear search"))
+                        .clicked()
+                {
+                    search_query.clear();
+                }
+            });
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(2.0);
+
+            let q = search_query.trim().to_ascii_lowercase();
+            let mut any_shown = false;
+            egui::ScrollArea::vertical()
+                .id_salt(format!("{}_scroll", id_salt))
+                .max_height(240.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_min_width(popup_w - 8.0);
+                    let sys_lbl = i18n::t("System Default");
+                    if q.is_empty()
+                        || "system default".contains(&q)
+                        || sys_lbl.to_lowercase().contains(&q)
+                    {
+                        any_shown = true;
+                        let selected = current_family.trim().is_empty();
+                        if ui.selectable_label(selected, sys_lbl).clicked() {
+                            picked = Some(String::new());
+                        }
+                    }
+                    for fam in system_font_families() {
+                        if !fam.matches_query(search_query) {
+                            continue;
+                        }
+                        any_shown = true;
+                        let selected = current_family.eq_ignore_ascii_case(&fam.name);
+                        if ui.selectable_label(selected, fam.display_label()).clicked() {
+                            picked = Some(fam.name.clone());
+                        }
+                    }
+                    if !any_shown {
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(i18n::t("No matching fonts found"))
+                                .weak()
+                                .small(),
+                        );
+                        ui.add_space(6.0);
+                    }
+                });
+
+            if picked.is_some() {
+                search_query.clear();
+                ui.memory_mut(|m| m.close_popup());
+            }
+        },
+    );
+
+    picked
+}
+
 /// Pill-style toggle switch.
 pub fn toggle_switch(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     let desired_size = Vec2::new(38.0, 20.0);
@@ -970,5 +1764,48 @@ mod tests {
         assert!(TextColorSetting::Custom(Color32::WHITE).has_low_contrast(false, ThemeAccent::Mint.palette()));
         assert!(!TextColorSetting::Custom(Color32::WHITE).has_low_contrast(true, ThemeAccent::Mint.palette()));
         assert_eq!(ThemeAccent::from_str_or_default("unknown"), ThemeAccent::Mint);
+    }
+
+    #[test]
+    fn system_font_registry_parsing_and_effects_work() {
+        assert_eq!(
+            parse_registry_font_name("Microsoft YaHei & Microsoft YaHei UI (TrueType)"),
+            Some(("Microsoft YaHei".into(), ParsedFontStyle::Regular))
+        );
+        assert_eq!(
+            parse_registry_font_name("Microsoft YaHei Bold & Microsoft YaHei UI Bold (TrueType)"),
+            Some(("Microsoft YaHei".into(), ParsedFontStyle::Bold))
+        );
+        assert_eq!(
+            parse_registry_font_name("Arial Bold Italic (TrueType)"),
+            Some(("Arial".into(), ParsedFontStyle::BoldItalic))
+        );
+        assert_eq!(
+            parse_registry_font_name("Segoe UI Italic (TrueType)"),
+            Some(("Segoe UI".into(), ParsedFontStyle::Italic))
+        );
+
+        let families = system_font_families();
+        assert!(!families.is_empty(), "expected at least one installed Windows font");
+
+        let ctx = egui::Context::default();
+        let font = FontSetting {
+            family: "Microsoft YaHei".into(),
+            size: 16,
+            bold: true,
+            italic: true,
+        };
+        apply_font(&ctx, &font);
+        assert_eq!(
+            ctx.style().text_styles.get(&TextStyle::Body).map(|f| f.size),
+            Some(16.0)
+        );
+        let mut out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("SnapDock 字体测试");
+            });
+        });
+        apply_font_effects_to_shapes(&ctx, &mut out.shapes);
+        assert!(!out.shapes.is_empty());
     }
 }

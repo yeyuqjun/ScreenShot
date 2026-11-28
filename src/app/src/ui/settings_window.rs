@@ -95,6 +95,12 @@ enum PairDirectionFilter {
     ToFocus,
 }
 
+#[derive(Clone, Debug, Default)]
+struct ProviderTestState {
+    testing: bool,
+    result: Option<Result<String, String>>,
+}
+
 pub struct SettingsWindowState {
     pub section: SettingsSection,
     pub draft: Value,
@@ -104,11 +110,16 @@ pub struct SettingsWindowState {
     pub provider_tab: usize, // 0 = ocr, 1 = translation
     pub meta_registration_enabled: Option<bool>,
     pub toast: Option<Toast>,
+    ocr_test: ProviderTestState,
+    trans_test: ProviderTestState,
     applied_preview: Option<(bool, ui::ThemeAccent, ui::TextColorSetting)>,
+    applied_font_preview: Option<ui::FontSetting>,
     applied_lang_preview: Option<i18n::EffectiveLanguage>,
+    font_query: String,
     src_lang_query: String,
     tgt_lang_query: String,
     pack_search: String,
+    search_pairs: bool,
     pack_filter: PackFilter,
     ocr_filter: OcrModelFilter,
     pair_direction: PairDirectionFilter,
@@ -128,11 +139,16 @@ impl SettingsWindowState {
             provider_tab: 0,
             meta_registration_enabled: None,
             toast: None,
+            ocr_test: ProviderTestState::default(),
+            trans_test: ProviderTestState::default(),
             applied_preview: None,
+            applied_font_preview: None,
             applied_lang_preview: None,
+            font_query: String::new(),
             src_lang_query: String::new(),
             tgt_lang_query: String::new(),
             pack_search: String::new(),
+            search_pairs: false,
             pack_filter: PackFilter::All,
             ocr_filter: OcrModelFilter::All,
             pair_direction: PairDirectionFilter::All,
@@ -150,6 +166,12 @@ impl SettingsWindowState {
             self.applied_preview = Some(target);
             ctx.request_repaint();
         }
+        let target_font = ui::theme_font(&self.draft);
+        if self.applied_font_preview.as_ref() != Some(&target_font) {
+            ui::apply_font(ctx, &target_font);
+            self.applied_font_preview = Some(target_font);
+            ctx.request_repaint();
+        }
         let eff_lang = i18n::apply_settings(&self.draft);
         if self.applied_lang_preview != Some(eff_lang) {
             self.applied_lang_preview = Some(eff_lang);
@@ -164,6 +186,31 @@ impl SettingsWindowState {
 
     pub fn notify(&mut self, message: impl Into<String>, error: bool) {
         self.toast = Some(Toast::new(message, error));
+    }
+
+    /// Record an OCR or translation provider test result inside the settings window.
+    pub fn apply_provider_test_result(&mut self, kind: &str, result: Result<String, String>) {
+        let slot = if kind == "ocr" {
+            &mut self.ocr_test
+        } else {
+            &mut self.trans_test
+        };
+        slot.testing = false;
+        match result {
+            Ok(text) => {
+                let preview: String = text.chars().take(120).collect();
+                let message = i18n::tf(
+                    "Provider test succeeded: {preview}",
+                    &[("preview", &preview)],
+                );
+                slot.result = Some(Ok(message.clone()));
+                self.notify(message, false);
+            }
+            Err(err) => {
+                slot.result = Some(Err(err.clone()));
+                self.notify(err, true);
+            }
+        }
     }
 
     fn save_draft(&mut self, app: &Arc<App>) {
@@ -223,10 +270,11 @@ impl SettingsWindowState {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    let body_sz = egui::TextStyle::Body.resolve(ui.style()).size;
                     icons::paint_inline(ui, Icon::Brand, 18.0, accent_text);
                     ui.label(
                         RichText::new(i18n::t("SnapDock"))
-                            .size(15.5)
+                            .size(body_sz + 2.5)
                             .strong()
                             .color(accent_text),
                     );
@@ -258,7 +306,9 @@ impl SettingsWindowState {
             .show(ctx, |ui| {
                 // Header title and save/revert controls.
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(self.section.label()).size(17.0).strong());
+                    let body_sz = egui::TextStyle::Body.resolve(ui.style()).size;
+                    icons::paint_inline(ui, self.section.icon(), 17.0, accent_text);
+                    ui.label(RichText::new(self.section.label()).size(body_sz + 4.0).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_enabled_ui(changed, |ui| {
                             if icons::icon_text_button(
@@ -344,7 +394,7 @@ impl SettingsWindowState {
             ui.add_space(4.0);
             ui.label(
                 RichText::new(i18n::t(
-                    "Default is English. Switch language for instant preview, then click Save to apply to all windows and tray menu.",
+                    "Default follows system language. Switch language for instant preview, then click Save to apply to all windows and tray menu.",
                 ))
                 .weak()
                 .small(),
@@ -564,13 +614,23 @@ impl SettingsWindowState {
             if cur_text_color.has_low_contrast(dark_mode, cur_palette) {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
+                    let warn_color = Color32::from_rgb(0xd9, 0x82, 0x2b);
+                    icons::paint_inline(ui, Icon::Alert, 14.0, warn_color);
                     ui.colored_label(
-                        Color32::from_rgb(0xd9, 0x82, 0x2b),
+                        warn_color,
                         i18n::t(
                             "The current text color has low contrast against the background and may be hard to read.",
                         ),
                     );
-                    if ui.small_button(i18n::t("Reset to Auto")).clicked() {
+                    if icons::small_icon_text_button(
+                        ui,
+                        Icon::Undo,
+                        i18n::t("Reset to Auto"),
+                        false,
+                        false,
+                    )
+                    .clicked()
+                    {
                         set_str(&mut self.draft, "general", "textColor", "auto".into());
                     }
                 });
@@ -580,6 +640,103 @@ impl SettingsWindowState {
             ui.label(
                 RichText::new(i18n::t(
                     "Theme, accent, and text color changes preview immediately. Click Save in the top-right to apply to all windows.",
+                ))
+                .weak()
+                .small(),
+            );
+        });
+
+        section_card(ui, i18n::t("Font Settings"), |ui| {
+            let cur_family = get_str(&self.draft, "general", "fontFamily");
+            let mut font_size = get_i64(&self.draft, "general", "fontSize", ui::DEFAULT_FONT_SIZE)
+                .clamp(ui::MIN_FONT_SIZE, ui::MAX_FONT_SIZE);
+            let mut font_bold = get_bool(&self.draft, "general", "fontBold");
+            let mut font_italic = get_bool(&self.draft, "general", "fontItalic");
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(i18n::t("Font Family")).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(picked) = ui::searchable_font_picker(
+                        ui,
+                        "general_font_family_picker",
+                        &cur_family,
+                        240.0,
+                        &mut self.font_query,
+                    ) {
+                        set_str(&mut self.draft, "general", "fontFamily", picked);
+                    }
+                });
+            });
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(i18n::t("Font Size")).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut font_size, ui::MIN_FONT_SIZE..=ui::MAX_FONT_SIZE)
+                            .suffix(" px"),
+                    );
+                });
+            });
+            set_i64(&mut self.draft, "general", "fontSize", font_size);
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(i18n::t("Font Style")).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_default = cur_family.is_empty()
+                        && font_size == ui::DEFAULT_FONT_SIZE
+                        && !font_bold
+                        && !font_italic;
+                    if !is_default
+                        && icons::small_icon_text_button(
+                            ui,
+                            Icon::Undo,
+                            i18n::t("Reset Font"),
+                            false,
+                            false,
+                        )
+                        .clicked()
+                    {
+                        set_str(&mut self.draft, "general", "fontFamily", String::new());
+                        set_i64(&mut self.draft, "general", "fontSize", ui::DEFAULT_FONT_SIZE);
+                        font_bold = false;
+                        font_italic = false;
+                    }
+                    if ui
+                        .selectable_label(font_italic, RichText::new(i18n::t("Italic")).italics())
+                        .clicked()
+                    {
+                        font_italic = !font_italic;
+                    }
+                    if ui
+                        .selectable_label(font_bold, RichText::new(i18n::t("Bold")).strong())
+                        .clicked()
+                    {
+                        font_bold = !font_bold;
+                    }
+                });
+            });
+            set_bool(&mut self.draft, "general", "fontBold", font_bold);
+            set_bool(&mut self.draft, "general", "fontItalic", font_italic);
+
+            ui.add_space(8.0);
+            egui::Frame::NONE
+                .fill(ui.visuals().faint_bg_color)
+                .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+                .corner_radius(CornerRadius::same(7))
+                .inner_margin(egui::Margin::symmetric(10, 7))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(i18n::t(
+                        "SnapDock Font Preview · Crisp screenshots & desktop pins 0123456789",
+                    ));
+                });
+
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(i18n::t(
+                    "Font changes preview immediately. Click Save in the top-right to apply to all windows.",
                 ))
                 .weak()
                 .small(),
@@ -796,7 +953,10 @@ impl SettingsWindowState {
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
-                    ui.colored_label(ui::DANGER, warnings.join("; "));
+                    ui.horizontal(|ui| {
+                        icons::paint_inline(ui, Icon::Alert, 15.0, ui::DANGER);
+                        ui.colored_label(ui::DANGER, warnings.join("; "));
+                    });
                 });
             ui.add_space(8.0);
         }
@@ -1007,8 +1167,30 @@ impl SettingsWindowState {
         window: &winit::window::Window,
     ) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.provider_tab, 0, i18n::t("Text Recognition (OCR)"));
-            ui.selectable_value(&mut self.provider_tab, 1, i18n::t("Translation"));
+            if icons::icon_text_button(
+                ui,
+                Icon::Ocr,
+                i18n::t("Text Recognition (OCR)"),
+                self.provider_tab == 0,
+                false,
+                None,
+            )
+            .clicked()
+            {
+                self.provider_tab = 0;
+            }
+            if icons::icon_text_button(
+                ui,
+                Icon::Translate,
+                i18n::t("Translation"),
+                self.provider_tab == 1,
+                false,
+                None,
+            )
+            .clicked()
+            {
+                self.provider_tab = 1;
+            }
         });
         ui.add_space(8.0);
 
@@ -1055,11 +1237,21 @@ impl SettingsWindowState {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(i18n::t("Mode")).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let clear_test_result = |ocr_test: &mut ProviderTestState,
+                                                 trans_test: &mut ProviderTestState| {
+                            if is_ocr {
+                                ocr_test.result = None;
+                            } else {
+                                trans_test.result = None;
+                            }
+                        };
                         if ui.selectable_label(mode == "ai", i18n::t("AI Model")).clicked() {
                             self.draft["providers"][pkey]["mode"] = json!("ai");
+                            clear_test_result(&mut self.ocr_test, &mut self.trans_test);
                         }
                         if ui.selectable_label(mode == "api", i18n::t("API Endpoint")).clicked() {
                             self.draft["providers"][pkey]["mode"] = json!("api");
+                            clear_test_result(&mut self.ocr_test, &mut self.trans_test);
                         }
                         let local_label = if is_ocr {
                             i18n::t("Local RapidOCR")
@@ -1068,6 +1260,7 @@ impl SettingsWindowState {
                         };
                         if ui.selectable_label(mode == "local", local_label).clicked() {
                             self.draft["providers"][pkey]["mode"] = json!("local");
+                            clear_test_result(&mut self.ocr_test, &mut self.trans_test);
                         }
                     });
                 });
@@ -1097,11 +1290,14 @@ impl SettingsWindowState {
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| {
                             if !has_dll {
-                                ui.colored_label(
-                                    ui::DANGER,
-                                    RichText::new(i18n::t("Missing onnxruntime.dll runtime"))
-                                        .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Alert, 14.0, ui::DANGER);
+                                    ui.colored_label(
+                                        ui::DANGER,
+                                        RichText::new(i18n::t("Missing onnxruntime.dll runtime"))
+                                            .strong(),
+                                    );
+                                });
                                 ui.label(
                                     RichText::new(i18n::t(
                                         "Ensure onnxruntime.dll exists in the application directory (shared with local RapidOCR).",
@@ -1112,27 +1308,33 @@ impl SettingsWindowState {
                             } else if status.ready {
                                 let family = status.model_set_family.unwrap_or("RapidOCR");
                                 let name = status.model_set_name.unwrap_or("default");
-                                ui.colored_label(
-                                    accent_text,
-                                    RichText::new(i18n::tf(
-                                        "Local RapidOCR ready ({family} · {name} · {installed} / {total} models)",
-                                        &[
-                                            ("family", family),
-                                            ("name", name),
-                                            ("installed", &status.installed_count.to_string()),
-                                            ("total", &status.models.len().to_string()),
-                                        ],
-                                    ))
-                                    .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Check, 14.0, accent_text);
+                                    ui.colored_label(
+                                        accent_text,
+                                        RichText::new(i18n::tf(
+                                            "Local RapidOCR ready ({family} · {name} · {installed} / {total} models)",
+                                            &[
+                                                ("family", family),
+                                                ("name", name),
+                                                ("installed", &status.installed_count.to_string()),
+                                                ("total", &status.models.len().to_string()),
+                                            ],
+                                        ))
+                                        .strong(),
+                                    );
+                                });
                             } else if status.installed_count == 0 && status.model_dir.is_none() {
-                                ui.colored_label(
-                                    status_color,
-                                    RichText::new(i18n::t(
-                                        "Runtime ready; no OCR models downloaded yet",
-                                    ))
-                                    .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Alert, 14.0, status_color);
+                                    ui.colored_label(
+                                        status_color,
+                                        RichText::new(i18n::t(
+                                            "Runtime ready; no OCR models downloaded yet",
+                                        ))
+                                        .strong(),
+                                    );
+                                });
                                 ui.label(
                                     RichText::new(i18n::t(
                                         "OCR models are downloaded on demand. Choose a download mirror and download a model below.",
@@ -1141,14 +1343,17 @@ impl SettingsWindowState {
                                     .small(),
                                 );
                             } else {
-                                ui.colored_label(
-                                    ui::DANGER,
-                                    RichText::new(i18n::tf(
-                                        "Incomplete models or runtime, missing: {missing}",
-                                        &[("missing", &status.missing.join(", "))],
-                                    ))
-                                    .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Alert, 14.0, ui::DANGER);
+                                    ui.colored_label(
+                                        ui::DANGER,
+                                        RichText::new(i18n::tf(
+                                            "Unavailable OCR model files: {missing}",
+                                            &[("missing", &status.missing.join(", "))],
+                                        ))
+                                        .strong(),
+                                    );
+                                });
                             }
                             ui.horizontal(|ui| {
                                 ui.label(
@@ -1162,12 +1367,17 @@ impl SettingsWindowState {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui
-                                            .small_button(i18n::t("Open Folder"))
-                                            .on_hover_text(i18n::t(
-                                                "View downloaded OCR models in File Explorer",
-                                            ))
-                                            .clicked()
+                                        if icons::small_icon_text_button(
+                                            ui,
+                                            Icon::Folder,
+                                            i18n::t("Open Folder"),
+                                            false,
+                                            false,
+                                        )
+                                        .on_hover_text(i18n::t(
+                                            "View downloaded OCR models in File Explorer",
+                                        ))
+                                        .clicked()
                                         {
                                             service::open_directory(app, &status.storage_dir);
                                         }
@@ -1185,33 +1395,6 @@ impl SettingsWindowState {
                                 );
                             }
                         });
-
-                    ui.add_space(8.0);
-                    let ocr_mirror = self.draft["providers"]["ocr"]["local"]["mirror"]
-                        .as_str()
-                        .unwrap_or("modelscope-cn")
-                        .to_string();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(i18n::t("Download Mirror")).strong());
-                        for (val, label) in [
-                            ("modelscope-cn", i18n::t("ModelScope (China)")),
-                            ("modelscope-ai", i18n::t("ModelScope Global")),
-                            ("hf-mirror", i18n::t("HF-Mirror (China Mirror)")),
-                            ("huggingface", i18n::t("HuggingFace Official")),
-                        ] {
-                            let selected = if val == "modelscope-cn" {
-                                !matches!(
-                                    ocr_mirror.as_str(),
-                                    "modelscope-ai" | "hf-mirror" | "huggingface"
-                                )
-                            } else {
-                                ocr_mirror == val
-                            };
-                            if ui.selectable_label(selected, label).clicked() {
-                                self.draft["providers"]["ocr"]["local"]["mirror"] = json!(val);
-                            }
-                        }
-                    });
 
                     ui.add_space(6.0);
                     let mut model_dir = self.draft["providers"]["ocr"]["local"]["modelDir"]
@@ -1297,11 +1480,14 @@ impl SettingsWindowState {
                         .inner_margin(egui::Margin::symmetric(12, 8))
                         .show(ui, |ui| {
                             if !has_dll {
-                                ui.colored_label(
-                                    ui::DANGER,
-                                    RichText::new(i18n::t("Missing onnxruntime.dll runtime"))
-                                        .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Alert, 14.0, ui::DANGER);
+                                    ui.colored_label(
+                                        ui::DANGER,
+                                        RichText::new(i18n::t("Missing onnxruntime.dll runtime"))
+                                            .strong(),
+                                    );
+                                });
                                 ui.label(
                                     RichText::new(i18n::t(
                                         "Ensure onnxruntime.dll exists in the application directory (shared with local RapidOCR).",
@@ -1310,25 +1496,31 @@ impl SettingsWindowState {
                                     .small(),
                                 );
                             } else if ready {
-                                ui.colored_label(
-                                    accent_text,
-                                    RichText::new(i18n::tf(
-                                        "Local offline translation ready ({installed} / {total} packs installed)",
-                                        &[
-                                            ("installed", &status.installed_count.to_string()),
-                                            ("total", &status.packs.len().to_string()),
-                                        ],
-                                    ))
-                                    .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Check, 14.0, accent_text);
+                                    ui.colored_label(
+                                        accent_text,
+                                        RichText::new(i18n::tf(
+                                            "Local offline translation ready ({installed} / {total} packs installed)",
+                                            &[
+                                                ("installed", &status.installed_count.to_string()),
+                                                ("total", &status.packs.len().to_string()),
+                                            ],
+                                        ))
+                                        .strong(),
+                                    );
+                                });
                             } else {
-                                ui.colored_label(
-                                    status_color,
-                                    RichText::new(i18n::t(
-                                        "Runtime ready; no translation language packs downloaded yet",
-                                    ))
-                                    .strong(),
-                                );
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Alert, 14.0, status_color);
+                                    ui.colored_label(
+                                        status_color,
+                                        RichText::new(i18n::t(
+                                            "Runtime ready; no usable translation language packs",
+                                        ))
+                                        .strong(),
+                                    );
+                                });
                                 ui.label(
                                     RichText::new(i18n::t(
                                         "Language packs are downloaded on demand. Download the language pairs you need below.",
@@ -1349,12 +1541,17 @@ impl SettingsWindowState {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui
-                                            .small_button(i18n::t("Open Folder"))
-                                            .on_hover_text(i18n::t(
-                                                "View downloaded language packs in File Explorer",
-                                            ))
-                                            .clicked()
+                                        if icons::small_icon_text_button(
+                                            ui,
+                                            Icon::Folder,
+                                            i18n::t("Open Folder"),
+                                            false,
+                                            false,
+                                        )
+                                        .on_hover_text(i18n::t(
+                                            "View downloaded language packs in File Explorer",
+                                        ))
+                                        .clicked()
                                         {
                                             service::open_directory(app, &status.storage_dir);
                                         }
@@ -1372,37 +1569,6 @@ impl SettingsWindowState {
                                 );
                             }
                         });
-
-                    ui.add_space(8.0);
-                    let mirror = self.draft["providers"]["translation"]["local"]["mirror"]
-                        .as_str()
-                        .unwrap_or("hf-mirror")
-                        .to_string();
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(i18n::t("Download Mirror")).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui
-                                .selectable_label(
-                                    mirror == "huggingface",
-                                    i18n::t("HuggingFace Official"),
-                                )
-                                .clicked()
-                            {
-                                self.draft["providers"]["translation"]["local"]["mirror"] =
-                                    json!("huggingface");
-                            }
-                            if ui
-                                .selectable_label(
-                                    mirror != "huggingface",
-                                    i18n::t("HF-Mirror (China Mirror)"),
-                                )
-                                .clicked()
-                            {
-                                self.draft["providers"]["translation"]["local"]["mirror"] =
-                                    json!("hf-mirror");
-                            }
-                        });
-                    });
 
                     ui.add_space(6.0);
                     let mut model_dir = self.draft["providers"]["translation"]["local"]["modelDir"]
@@ -1586,10 +1752,16 @@ impl SettingsWindowState {
                             self.draft["providers"]["translation"]["source"] = json!(picked);
                         }
 
-                        if ui
-                            .button("\u{21C4}")
-                            .on_hover_text(i18n::t("Swap source and target languages"))
-                            .clicked()
+                        if icons::icon_button_sized(
+                            ui,
+                            Icon::Swap,
+                            egui::Vec2::splat(28.0),
+                            15.0,
+                            false,
+                            false,
+                        )
+                        .on_hover_text(i18n::t("Swap source and target languages"))
+                        .clicked()
                         {
                             let new_src = if tgt_code == "auto" {
                                 "zh".to_string()
@@ -1691,9 +1863,14 @@ impl SettingsWindowState {
                                                 ))
                                                 .small(),
                                             );
-                                            if ui
-                                                .small_button(i18n::t("Download Required Packs"))
-                                                .clicked()
+                                            if icons::small_icon_text_button(
+                                                ui,
+                                                Icon::Save,
+                                                i18n::t("Download Required Packs"),
+                                                false,
+                                                true,
+                                            )
+                                            .clicked()
                                             {
                                                 for pack in &plan.missing {
                                                     service::download_translation_pack(
@@ -1750,9 +1927,14 @@ impl SettingsWindowState {
                                         ))
                                         .small(),
                                     );
-                                    if ui
-                                        .small_button(i18n::t("Download Required Packs"))
-                                        .clicked()
+                                    if icons::small_icon_text_button(
+                                        ui,
+                                        Icon::Save,
+                                        i18n::t("Download Required Packs"),
+                                        false,
+                                        true,
+                                    )
+                                    .clicked()
                                     {
                                         for pack in &plan.missing {
                                             service::download_translation_pack(
@@ -1770,17 +1952,44 @@ impl SettingsWindowState {
                 }
 
                 ui.add_space(8.0);
-                if icons::icon_text_button(
-                    ui,
-                    Icon::Check,
-                    i18n::t("Save & Test"),
-                    false,
-                    false,
-                    None,
-                )
-                .clicked()
-                {
+                let is_testing = if is_ocr {
+                    self.ocr_test.testing
+                } else {
+                    self.trans_test.testing
+                };
+                let mut trigger_test = false;
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!is_testing, |ui| {
+                        if icons::icon_text_button(
+                            ui,
+                            Icon::Check,
+                            if is_testing {
+                                i18n::t("Testing...")
+                            } else {
+                                i18n::t("Save & Test")
+                            },
+                            false,
+                            false,
+                            None,
+                        )
+                        .clicked()
+                        {
+                            trigger_test = true;
+                        }
+                    });
+                    if is_testing {
+                        ui.spinner();
+                    }
+                });
+                if trigger_test {
                     if let Err(e) = service::update_settings(app, &self.draft) {
+                        if is_ocr {
+                            self.ocr_test.testing = false;
+                            self.ocr_test.result = Some(Err(e.clone()));
+                        } else {
+                            self.trans_test.testing = false;
+                            self.trans_test.result = Some(Err(e.clone()));
+                        }
                         self.notify(e, true);
                     } else {
                         self.reload_from_app(app);
@@ -1797,6 +2006,8 @@ impl SettingsWindowState {
                                 .unwrap_or("local")
                                 == "local";
                             if latest_id.is_some() || local_mode {
+                                self.ocr_test.testing = true;
+                                self.ocr_test.result = None;
                                 service::run_text_process(
                                     app,
                                     TextTarget::SettingsTest,
@@ -1805,7 +2016,10 @@ impl SettingsWindowState {
                                     None,
                                 );
                             } else {
-                                self.notify(i18n::t("Capture an image first to test OCR"), true);
+                                let msg = i18n::t("Capture an image first to test OCR").to_string();
+                                self.ocr_test.testing = false;
+                                self.ocr_test.result = Some(Err(msg.clone()));
+                                self.notify(msg, true);
                             }
                         } else {
                             let src = crate::translate::normalize_lang_code(
@@ -1819,6 +2033,8 @@ impl SettingsWindowState {
                                     .unwrap_or("en"),
                             );
                             let sample = i18n::sample_text_for_lang(&src, &tgt);
+                            self.trans_test.testing = true;
+                            self.trans_test.result = None;
                             service::run_text_process(
                                 app,
                                 TextTarget::SettingsTest,
@@ -1826,6 +2042,78 @@ impl SettingsWindowState {
                                 None,
                                 Some(sample.into()),
                             );
+                        }
+                    }
+                }
+
+                let test_result = if is_ocr {
+                    self.ocr_test.result.clone()
+                } else {
+                    self.trans_test.result.clone()
+                };
+                if let Some(res) = test_result {
+                    ui.add_space(8.0);
+                    let palette = ui::ctx_palette(ui.ctx());
+                    let accent_text = palette.accent_text(ui.visuals().dark_mode);
+                    let (is_ok, msg) = match &res {
+                        Ok(m) => (true, m.as_str()),
+                        Err(m) => (false, m.as_str()),
+                    };
+                    let color = if is_ok { palette.accent } else { ui::DANGER };
+                    let text_color = if is_ok { accent_text } else { ui::DANGER };
+                    let mut dismiss_result = false;
+                    egui::Frame::NONE
+                        .fill(color.gamma_multiply(0.10))
+                        .stroke(egui::Stroke::new(1.0_f32, color.gamma_multiply(0.55)))
+                        .corner_radius(CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(12, 8))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                icons::paint_inline(
+                                    ui,
+                                    if is_ok { Icon::Check } else { Icon::Alert },
+                                    14.0,
+                                    text_color,
+                                );
+                                let text_w = (ui.available_width() - 28.0).max(120.0);
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(text_w, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(msg).color(text_color).small(),
+                                            )
+                                            .wrap(),
+                                        );
+                                    },
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if icons::icon_button_sized(
+                                            ui,
+                                            Icon::Close,
+                                            egui::Vec2::splat(20.0),
+                                            12.0,
+                                            false,
+                                            false,
+                                        )
+                                        .on_hover_text(i18n::t("Close"))
+                                        .clicked()
+                                        {
+                                            dismiss_result = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    if dismiss_result {
+                        if is_ocr {
+                            self.ocr_test.result = None;
+                        } else {
+                            self.trans_test.result = None;
                         }
                     }
                 }
@@ -1838,28 +2126,51 @@ impl SettingsWindowState {
             .to_string();
         if is_ocr && mode_after == "local" {
             let status = crate::ocr::inspect_status(&app.data_dir, &self.draft);
-            let mirror = self.draft["providers"]["ocr"]["local"]["mirror"]
+            let mut mirror = self.draft["providers"]["ocr"]["local"]["mirror"]
                 .as_str()
                 .unwrap_or("modelscope-cn")
                 .to_string();
-            let use_cls = self.draft["providers"]["ocr"]["local"]["useCls"]
-                .as_bool()
-                .unwrap_or(false);
+            let selected_model = self.draft["providers"]["ocr"]["local"]["model"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
             let palette = ui::ctx_palette(ui.ctx());
             let accent_text = palette.accent_text(ui.visuals().dark_mode);
 
-            section_card(
-                ui,
-                i18n::t("Available OCR Models (RapidOCR ONNX)"),
-                |ui| {
-                    ui.label(
-                        RichText::new(i18n::t(
-                            "Models are saved under models\\ocr. PP-OCRv5 Mobile or PP-OCRv6 Small is recommended for most scenarios.",
-                        ))
-                        .weak()
-                        .small(),
-                    );
-                    ui.add_space(8.0);
+            section_card(ui, i18n::t("Available OCR Models (RapidOCR ONNX)"), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(i18n::t("Download Mirror")).strong());
+                    for (val, label) in [
+                        ("modelscope-cn", i18n::t("ModelScope (China)")),
+                        ("modelscope-ai", i18n::t("ModelScope Global")),
+                        ("hf-mirror", i18n::t("HF-Mirror (China Mirror)")),
+                        ("huggingface", i18n::t("HuggingFace Official")),
+                    ] {
+                        let selected = if val == "modelscope-cn" {
+                            !matches!(
+                                mirror.as_str(),
+                                "modelscope-ai" | "hf-mirror" | "huggingface"
+                            )
+                        } else {
+                            mirror == val
+                        };
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.draft["providers"]["ocr"]["local"]["mirror"] = json!(val);
+                            mirror = val.to_string();
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                if ui
+                    .selectable_label(
+                        selected_model.is_empty(),
+                        i18n::t("Choose OCR model automatically"),
+                    )
+                    .clicked()
+                {
+                    self.draft["providers"]["ocr"]["local"]["model"] = json!("");
+                }
+                ui.add_space(8.0);
 
                     let total_count = status.models.len();
                     let installed_count = status.installed_count;
@@ -1922,26 +2233,33 @@ impl SettingsWindowState {
                                 RichText::new(i18n::t("No matching OCR models found.")).weak(),
                             );
                             if self.ocr_filter != OcrModelFilter::All
-                                && ui.small_button(i18n::t("Show All")).clicked()
+                                && icons::small_icon_text_button(
+                                    ui,
+                                    Icon::Reselect,
+                                    i18n::t("Show All"),
+                                    false,
+                                    false,
+                                )
+                                .clicked()
                             {
                                 self.ocr_filter = OcrModelFilter::All;
                             }
                         });
                     }
 
-                    for model in filtered {
-                        let downloading = active_ocr_downloads.get(model.pack.id);
-                        let is_active =
-                            model.installed && status.model_set_name == Some(model.pack.id);
-                        let row_stroke = if is_active {
-                            palette.accent.gamma_multiply(0.70)
-                        } else if model.installed {
-                            palette.accent.gamma_multiply(0.42)
-                        } else if model.pack.tier == crate::ocr::OcrModelTier::Recommended {
-                            palette.accent.gamma_multiply(0.28)
-                        } else {
-                            ui.visuals().widgets.noninteractive.bg_stroke.color
-                        };
+                for model in filtered {
+                    let downloading = active_ocr_downloads.get(model.pack.id);
+                    let is_active = model.installed && status.model_set_name == Some(model.pack.id);
+                    let is_selected = selected_model == model.pack.id;
+                    let row_stroke = if is_active || is_selected {
+                        palette.accent.gamma_multiply(0.70)
+                    } else if model.installed {
+                        palette.accent.gamma_multiply(0.42)
+                    } else if model.pack.tier == crate::ocr::OcrModelTier::Recommended {
+                        palette.accent.gamma_multiply(0.28)
+                    } else {
+                        ui.visuals().widgets.noninteractive.bg_stroke.color
+                    };
 
                         egui::Frame::NONE
                             .fill(ui.visuals().faint_bg_color)
@@ -2029,11 +2347,8 @@ impl SettingsWindowState {
                                                     ("desc", model.pack.display_description()),
                                                 ],
                                             )
-                                        } else if use_cls && model.disk_bytes > 0 && !model.has_cls {
-                                            i18n::tf(
-                                                "Missing orientation model · Click Download to complete ({desc})",
-                                                &[("desc", model.pack.display_description())],
-                                            )
+                                        } else if !model.local_dirs.is_empty() {
+                                            i18n::t("Incomplete model files").to_string()
                                         } else {
                                             i18n::tf(
                                                 "Not installed · ~{mb} MB · {desc}",
@@ -2044,6 +2359,9 @@ impl SettingsWindowState {
                                             )
                                         };
                                         ui.label(RichText::new(subtitle).weak().small());
+                                        if downloading.is_none() && !model.local_dirs.is_empty() {
+                                            show_model_file_issues(ui, &model.missing, &model.invalid);
+                                        }
                                     });
 
                                     ui.with_layout(
@@ -2062,80 +2380,39 @@ impl SettingsWindowState {
                                                         model.pack.id,
                                                     );
                                                 }
-                                            } else if model.installed {
-                                                if model.managed
-                                                    && icons::icon_text_button_danger(
-                                                        ui,
-                                                        Icon::Trash,
-                                                        i18n::t("Delete"),
-                                                    )
-                                                    .clicked()
+                                            } else {
+                                                if !model.local_dirs.is_empty()
+                                                    && confirm_model_delete(ui, window, model.pack.display_label(), &model.local_dirs)
                                                 {
-                                                    let answer = rfd::MessageDialog::new()
-                                                        .set_parent(window)
-                                                        .set_title(i18n::t("Delete OCR Model"))
-                                                        .set_description(i18n::tf(
-                                                            "Delete downloaded OCR model [{label}]? You can re-download it anytime.",
-                                                            &[(
-                                                                "label",
-                                                                model.pack.display_label(),
-                                                            )],
-                                                        ))
-                                                        .set_buttons(rfd::MessageButtons::YesNo)
-                                                        .show();
-                                                    if answer == rfd::MessageDialogResult::Yes {
-                                                        if self.draft["providers"]["ocr"]["local"]
-                                                            ["model"]
-                                                            .as_str()
-                                                            == Some(model.pack.id)
-                                                        {
-                                                            self.draft["providers"]["ocr"]["local"]
-                                                                ["model"] = json!("");
-                                                        }
-                                                        service::delete_ocr_model(
-                                                            app,
-                                                            model.pack.id,
-                                                            &status.storage_dir,
-                                                        );
-                                                    }
+                                                    service::delete_ocr_model(app, model.pack.id, &status.storage_dir, &model.local_dirs);
                                                 }
-                                                if is_active {
-                                                    ui.colored_label(
-                                                        accent_text,
-                                                        RichText::new(i18n::t("Active"))
-                                                            .small()
-                                                            .strong(),
-                                                    );
-                                                } else if ui
-                                                    .small_button(i18n::t("Use"))
+                                                if (!model.installed || !model.invalid.is_empty()) && download_model_button(
+                                                    ui,
+                                                    !model.local_dirs.is_empty(),
+                                                    &crate::ocr::model_pack_dir_in(&status.storage_dir, model.pack.id),
+                                                ) {
+                                                    service::download_ocr_model(app, model.pack.id.to_string(), status.storage_dir.clone(), mirror.clone());
+                                                }
+                                                if is_active || is_selected {
+                                                    let label = if is_active { "Active" } else { "Selected" };
+                                                    ui.colored_label(accent_text, RichText::new(i18n::t(label)).small().strong());
+                                                }
+                                                if model.installed
+                                                    && !is_selected
+                                                    && icons::small_icon_text_button(
+                                                        ui,
+                                                        Icon::Check,
+                                                        i18n::t("Use"),
+                                                        false,
+                                                        false,
+                                                    )
                                                     .on_hover_text(i18n::t(
                                                         "Set as active local OCR model",
                                                     ))
                                                     .clicked()
                                                 {
-                                                    self.draft["providers"]["ocr"]["local"]
-                                                        ["model"] = json!(model.pack.id);
+                                                    self.draft["providers"]["ocr"]["local"]["model"] = json!(model.pack.id);
                                                 }
-                                            } else if icons::icon_text_button(
-                                                ui,
-                                                Icon::Save,
-                                                i18n::t("Download"),
-                                                false,
-                                                true,
-                                                None,
-                                            )
-                                            .on_hover_text(i18n::tf(
-                                                "Download to {path}",
-                                                &[("path", &model.dir.display().to_string())],
-                                            ))
-                                            .clicked()
-                                            {
-                                                service::download_ocr_model(
-                                                    app,
-                                                    model.pack.id.to_string(),
-                                                    status.storage_dir.clone(),
-                                                    mirror.clone(),
-                                                );
                                             }
                                         },
                                     );
@@ -2156,7 +2433,7 @@ impl SettingsWindowState {
             );
         } else if !is_ocr && mode_after == "local" {
             let status = crate::translate::inspect_status(&app.data_dir, &self.draft);
-            let mirror = self.draft["providers"]["translation"]["local"]["mirror"]
+            let mut mirror = self.draft["providers"]["translation"]["local"]["mirror"]
                 .as_str()
                 .unwrap_or("hf-mirror")
                 .to_string();
@@ -2165,13 +2442,46 @@ impl SettingsWindowState {
                 ui,
                 i18n::t("Available Translation Packs & Pairs (OPUS-MT INT8 ONNX)"),
                 |ui| {
-                    ui.label(
-                        RichText::new(i18n::t(
-                            "Download the two universal packs (mul-en & en-mul) to unlock all 42 languages, or search a language (e.g. Japanese, ja->zh) to list all translation directions to and from it.",
-                        ))
-                        .weak()
-                        .small(),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(i18n::t("Download Mirror")).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .selectable_label(
+                                    mirror == "huggingface",
+                                    i18n::t("HuggingFace Official"),
+                                )
+                                .clicked()
+                            {
+                                self.draft["providers"]["translation"]["local"]["mirror"] =
+                                    json!("huggingface");
+                                mirror = "huggingface".to_string();
+                            }
+                            if ui
+                                .selectable_label(
+                                    mirror != "huggingface",
+                                    i18n::t("HF-Mirror (China Mirror)"),
+                                )
+                                .clicked()
+                            {
+                                self.draft["providers"]["translation"]["local"]["mirror"] =
+                                    json!("hf-mirror");
+                                mirror = "hf-mirror".to_string();
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.search_pairs,
+                            false,
+                            i18n::t("Language Packs"),
+                        );
+                        ui.selectable_value(
+                            &mut self.search_pairs,
+                            true,
+                            i18n::t("Translation Pairs"),
+                        );
+                    });
                     ui.add_space(8.0);
 
                     // Search bar with clear button.
@@ -2202,10 +2512,16 @@ impl SettingsWindowState {
                     let accent_text = palette.accent_text(ui.visuals().dark_mode);
 
                     // When the search query targets one or two languages, show expanded directed pairs.
-                    if let Some(pair_res) = crate::translate::search_translation_pairs(
-                        &self.pack_search,
-                        &status.storage_dir,
-                    ) {
+                    if let Some(pair_res) = self
+                        .search_pairs
+                        .then(|| {
+                            crate::translate::search_translation_pairs(
+                                &self.pack_search,
+                                &status.storage_dir,
+                            )
+                        })
+                        .flatten()
+                    {
                         let total_pairs = pair_res.pairs.len();
                         let ready_pairs = pair_res.pairs.iter().filter(|p| p.ready()).count();
                         let missing_pairs = total_pairs.saturating_sub(ready_pairs);
@@ -2330,7 +2646,15 @@ impl SettingsWindowState {
                                     RichText::new(i18n::t("No matching translation pairs found."))
                                         .weak(),
                                 );
-                                if ui.small_button(i18n::t("Show All")).clicked() {
+                                if icons::small_icon_text_button(
+                                    ui,
+                                    Icon::Reselect,
+                                    i18n::t("Show All"),
+                                    false,
+                                    false,
+                                )
+                                .clicked()
+                                {
                                     self.pack_filter = PackFilter::All;
                                     self.pair_direction = PairDirectionFilter::All;
                                 }
@@ -2512,12 +2836,17 @@ impl SettingsWindowState {
                                                             }
                                                         }
                                                     }
-                                                    if ui
-                                                        .small_button(i18n::t("Use"))
-                                                        .on_hover_text(i18n::t(
-                                                            "Set as current source and target languages",
-                                                        ))
-                                                        .clicked()
+                                                    if icons::small_icon_text_button(
+                                                        ui,
+                                                        Icon::Check,
+                                                        i18n::t("Use"),
+                                                        false,
+                                                        false,
+                                                    )
+                                                    .on_hover_text(i18n::t(
+                                                        "Set as current source and target languages",
+                                                    ))
+                                                    .clicked()
                                                     {
                                                         self.draft["providers"]["translation"]
                                                             ["source"] = json!(pair.source_code);
@@ -2577,8 +2906,11 @@ impl SettingsWindowState {
                                 });
                             ui.add_space(6.0);
                         }
+                    } else if self.search_pairs {
+                        ui.label(i18n::t(
+                            "Search for a language or direction, e.g. Japanese or ja->zh.",
+                        ));
                     } else {
-                        // Standard underlying OPUS-MT pack catalog view.
                         let total_count = status.packs.len();
                         let installed_count = status.installed_count;
                         let not_installed_count = total_count.saturating_sub(installed_count);
@@ -2665,7 +2997,14 @@ impl SettingsWindowState {
                                 );
                                 if (!self.pack_search.is_empty()
                                     || self.pack_filter != PackFilter::All)
-                                    && ui.small_button(i18n::t("Show All")).clicked()
+                                    && icons::small_icon_text_button(
+                                        ui,
+                                        Icon::Reselect,
+                                        i18n::t("Show All"),
+                                        false,
+                                        false,
+                                    )
+                                    .clicked()
                                 {
                                     self.pack_search.clear();
                                     self.pack_filter = PackFilter::All;
@@ -2764,6 +3103,8 @@ impl SettingsWindowState {
                                                         ("repo", pack.spec.repo),
                                                     ],
                                                 )
+                                            } else if pack.has_local_files {
+                                                i18n::t("Incomplete model files").to_string()
                                             } else {
                                                 i18n::tf(
                                                     "Not installed · ~{mb} MB · {repo}",
@@ -2774,6 +3115,9 @@ impl SettingsWindowState {
                                                 )
                                             };
                                             ui.label(RichText::new(subtitle).weak().small());
+                                            if downloading.is_none() && pack.has_local_files {
+                                                show_model_file_issues(ui, &pack.missing, &pack.invalid);
+                                            }
                                         });
 
                                         ui.with_layout(
@@ -2792,64 +3136,17 @@ impl SettingsWindowState {
                                                             pack.spec.id,
                                                         );
                                                     }
-                                                } else if pack.installed {
-                                                    if icons::icon_text_button_danger(
-                                                        ui,
-                                                        Icon::Trash,
-                                                        i18n::t("Delete"),
-                                                    )
-                                                    .clicked()
-                                                    {
-                                                        let answer = rfd::MessageDialog::new()
-                                                            .set_parent(window)
-                                                            .set_title(i18n::t(
-                                                                "Delete Language Pack",
-                                                            ))
-                                                            .set_description(i18n::tf(
-                                                                "Delete downloaded language pack [{label}]? You can re-download it anytime.",
-                                                                &[(
-                                                                    "label",
-                                                                    &pack.spec.display_label(),
-                                                                )],
-                                                            ))
-                                                            .set_buttons(
-                                                                rfd::MessageButtons::YesNo,
-                                                            )
-                                                            .show();
-                                                        if answer == rfd::MessageDialogResult::Yes {
-                                                            service::delete_translation_pack(
-                                                                app,
-                                                                pack.spec.id,
-                                                                &status.storage_dir,
-                                                            );
-                                                        }
+                                                } else {
+                                                    if pack.has_local_files && confirm_model_delete(
+                                                        ui, window, &pack.spec.display_label(), std::slice::from_ref(&pack.dir),
+                                                    ) {
+                                                        service::delete_translation_pack(app, pack.spec.id, &status.storage_dir);
                                                     }
-                                                    ui.colored_label(
-                                                        accent_text,
-                                                        RichText::new(i18n::t("Ready"))
-                                                            .small()
-                                                            .strong(),
-                                                    );
-                                                } else if icons::icon_text_button(
-                                                    ui,
-                                                    Icon::Save,
-                                                    i18n::t("Download"),
-                                                    false,
-                                                    true,
-                                                    None,
-                                                )
-                                                .on_hover_text(i18n::tf(
-                                                    "Download to {path}",
-                                                    &[("path", &pack.dir.display().to_string())],
-                                                ))
-                                                .clicked()
-                                                {
-                                                    service::download_translation_pack(
-                                                        app,
-                                                        pack.spec.id.to_string(),
-                                                        status.storage_dir.clone(),
-                                                        mirror.clone(),
-                                                    );
+                                                    if pack.installed {
+                                                        ui.colored_label(accent_text, RichText::new(i18n::t("Ready")).small().strong());
+                                                    } else if download_model_button(ui, pack.has_local_files, &pack.dir) {
+                                                        service::download_translation_pack(app, pack.spec.id.to_string(), status.storage_dir.clone(), mirror.clone());
+                                                    }
                                                 }
                                             },
                                         );
@@ -2904,13 +3201,19 @@ impl SettingsWindowState {
                     i18n::t("Certificate: PEM certificate configured")
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .button(if ca_pem.is_empty() {
+                    if icons::icon_text_button(
+                        ui,
+                        Icon::Shield,
+                        if ca_pem.is_empty() {
                             i18n::t("Import Certificate")
                         } else {
                             i18n::t("Replace")
-                        })
-                        .clicked()
+                        },
+                        false,
+                        false,
+                        None,
+                    )
+                    .clicked()
                     {
                         if let Some(path) = rfd::FileDialog::new()
                             .set_parent(window)
@@ -2939,7 +3242,17 @@ impl SettingsWindowState {
                             }
                         }
                     }
-                    if !ca_pem.is_empty() && ui.button(i18n::t("Clear")).clicked() {
+                    if !ca_pem.is_empty()
+                        && icons::icon_text_button(
+                            ui,
+                            Icon::Close,
+                            i18n::t("Clear"),
+                            false,
+                            false,
+                            None,
+                        )
+                        .clicked()
+                    {
                         set_str(&mut self.draft, "service", "caPem", String::new());
                         self.meta_registration_enabled = None;
                     }
@@ -2956,16 +3269,34 @@ impl SettingsWindowState {
                         } else {
                             i18n::t("Connected · Registration Closed")
                         };
-                        ui.colored_label(accent_text, format!("\u{25CF} {}", status_text));
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot_rect.center(), 4.2, accent_text);
+                        ui.colored_label(accent_text, status_text);
                     }
                     None => {
-                        ui.label(
-                            RichText::new(format!("\u{25CB} {}", i18n::t("Not checked"))).weak(),
+                        let weak_color = ui.visuals().weak_text_color();
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(egui::Vec2::splat(10.0), egui::Sense::hover());
+                        ui.painter().circle_stroke(
+                            dot_rect.center(),
+                            4.0,
+                            egui::Stroke::new(1.4_f32, weak_color),
                         );
+                        ui.label(RichText::new(i18n::t("Not checked")).weak());
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(i18n::t("Check Connection")).clicked() {
+                    if icons::icon_text_button(
+                        ui,
+                        Icon::Reselect,
+                        i18n::t("Check Connection"),
+                        false,
+                        false,
+                        None,
+                    )
+                    .clicked()
+                    {
                         service::check_service_meta(
                             app,
                             get_str(&self.draft, "service", "url"),
@@ -2982,7 +3313,16 @@ impl SettingsWindowState {
                     ui.label(RichText::new(&acc.username).strong().size(15.0));
                     ui.label(RichText::new(format!("v{}", acc.revision)).weak());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button(i18n::t("Sign Out")).clicked() {
+                        if icons::icon_text_button(
+                            ui,
+                            Icon::LogOut,
+                            i18n::t("Sign Out"),
+                            false,
+                            false,
+                            None,
+                        )
+                        .clicked()
+                        {
                             service::logout(app);
                         }
                     });
@@ -3068,19 +3408,22 @@ impl SettingsWindowState {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let can_submit = !username.trim().is_empty() && !self.password.is_empty();
-                    let login_fill = ui::ctx_palette(ui.ctx()).accent;
-                    if ui
-                        .add_enabled(
-                            can_submit,
-                            egui::Button::new(
-                                RichText::new(i18n::t("Sign In"))
-                                    .color(Color32::WHITE)
-                                    .strong(),
-                            )
-                            .fill(login_fill),
+                    let mut do_sign_in = false;
+                    ui.add_enabled_ui(can_submit, |ui| {
+                        if icons::icon_text_button(
+                            ui,
+                            Icon::LogIn,
+                            i18n::t("Sign In"),
+                            false,
+                            true,
+                            None,
                         )
                         .clicked()
-                    {
+                        {
+                            do_sign_in = true;
+                        }
+                    });
+                    if do_sign_in {
                         if let Err(e) = service::update_settings(app, &self.draft) {
                             self.notify(e, true);
                         } else {
@@ -3095,13 +3438,22 @@ impl SettingsWindowState {
                         }
                     }
                     let reg_open = self.meta_registration_enabled == Some(true);
-                    if ui
-                        .add_enabled(
-                            can_submit && reg_open,
-                            egui::Button::new(i18n::t("Register")),
+                    let mut do_register = false;
+                    ui.add_enabled_ui(can_submit && reg_open, |ui| {
+                        if icons::icon_text_button(
+                            ui,
+                            Icon::UserPlus,
+                            i18n::t("Register"),
+                            false,
+                            false,
+                            None,
                         )
                         .clicked()
-                    {
+                        {
+                            do_register = true;
+                        }
+                    });
+                    if do_register {
                         if let Err(e) = service::update_settings(app, &self.draft) {
                             self.notify(e, true);
                         } else {
@@ -3140,13 +3492,73 @@ fn set_str(val: &mut Value, p1: &str, p2: &str, v: String) {
     val[p1][p2] = json!(v);
 }
 
+fn show_model_file_issues(ui: &mut egui::Ui, missing: &[&str], invalid: &[&str]) {
+    if !missing.is_empty() {
+        ui.label(
+            RichText::new(i18n::tf(
+                "Missing files: {files}",
+                &[("files", &missing.join(", "))],
+            ))
+            .weak()
+            .small(),
+        );
+    }
+    if !invalid.is_empty() {
+        ui.colored_label(
+            ui::DANGER,
+            RichText::new(i18n::tf(
+                "Invalid files: {files}",
+                &[("files", &invalid.join(", "))],
+            ))
+            .small(),
+        );
+    }
+}
+
+fn download_model_button(ui: &mut egui::Ui, repair: bool, dir: &std::path::Path) -> bool {
+    let label = if repair { "Repair" } else { "Download" };
+    icons::icon_text_button(ui, Icon::Save, i18n::t(label), false, true, None)
+        .on_hover_text(i18n::tf(
+            "Download to {path}",
+            &[("path", &dir.display().to_string())],
+        ))
+        .clicked()
+}
+
+fn confirm_model_delete(
+    ui: &mut egui::Ui,
+    window: &winit::window::Window,
+    label: &str,
+    dirs: &[std::path::PathBuf],
+) -> bool {
+    if !icons::icon_text_button_danger(ui, Icon::Trash, i18n::t("Delete")).clicked() {
+        return false;
+    }
+    let paths = dirs
+        .iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    rfd::MessageDialog::new()
+        .set_parent(window)
+        .set_title(i18n::t("Delete Model Files"))
+        .set_description(i18n::tf(
+            "Delete local files for [{label}]?\n\n{paths}",
+            &[("label", label), ("paths", &paths)],
+        ))
+        .set_buttons(rfd::MessageButtons::YesNo)
+        .show()
+        == rfd::MessageDialogResult::Yes
+}
+
 fn section_card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style())
         .inner_margin(egui::Margin::same(14))
         .corner_radius(CornerRadius::same(10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().size(14.5));
+            let body_sz = egui::TextStyle::Body.resolve(ui.style()).size;
+            ui.label(RichText::new(title).strong().size(body_sz + 1.5));
             ui.add_space(6.0);
             add_contents(ui);
         });
@@ -3197,4 +3609,40 @@ fn setting_number_row(
         });
     });
     ui.add_space(4.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_test_results_update_settings_state_and_in_window_toast() {
+        let app = App::new(std::env::temp_dir().join("snapdock-settings-test"));
+        let mut state = SettingsWindowState::new(&app, Some("providers"));
+
+        state.ocr_test.testing = true;
+        state.apply_provider_test_result("ocr", Ok("SnapDock OCR Test".into()));
+        assert!(!state.ocr_test.testing);
+        let ocr_msg = state
+            .ocr_test
+            .result
+            .as_ref()
+            .and_then(|r| r.as_ref().ok())
+            .expect("ocr test result should be recorded");
+        assert!(ocr_msg.contains("SnapDock OCR Test"));
+        let toast = state.toast.as_ref().expect("in-window toast should be set");
+        assert!(!toast.error);
+        assert_eq!(toast.message, *ocr_msg);
+
+        state.trans_test.testing = true;
+        state.apply_provider_test_result("translation", Err("timeout".into()));
+        assert!(!state.trans_test.testing);
+        assert_eq!(
+            state.trans_test.result.as_ref(),
+            Some(&Err("timeout".to_string()))
+        );
+        let toast = state.toast.as_ref().expect("error toast should be set");
+        assert!(toast.error);
+        assert_eq!(toast.message, "timeout");
+    }
 }

@@ -22,13 +22,74 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Logical gap between pin image window and companion toolbar / plain-text panel.
+#[allow(dead_code)]
 pub const COMPANION_GAP_LOGICAL: f32 = 8.0;
+/// Logical shadow margin extending outward on all four sides around the pinned image.
+pub const PIN_SHADOW_PAD_LOGICAL: f32 = 12.0;
+/// Logical gap between the outer edge of the pin window (including shadow) and the companion toolbar.
+pub const TOOLBAR_SHADOW_GAP_LOGICAL: f32 = 3.0;
+/// Logical gap between the outer edge of the pin window (including shadow) and the companion text panel.
+pub const TEXT_PANEL_SHADOW_GAP_LOGICAL: f32 = 4.0;
 /// Logical height reserved for the inline target language picker inside the toolbar window.
 pub const LANG_PICKER_HEIGHT_LOGICAL: f32 = 228.0;
 /// Preferred logical width of the right-side plain-text panel.
 pub const TEXT_PANEL_WIDTH_LOGICAL: f32 = 320.0;
 pub const TEXT_PANEL_MIN_WIDTH_LOGICAL: f32 = 220.0;
 pub const TEXT_PANEL_MIN_HEIGHT_LOGICAL: f32 = 220.0;
+
+/// Physical-pixel shadow margin around each side of the pinned image for a given monitor scale factor.
+pub fn pin_shadow_pad_physical(scale_factor: f64) -> i32 {
+    (PIN_SHADOW_PAD_LOGICAL as f64 * scale_factor.max(0.5)).round() as i32
+}
+
+/// Expand a physical image rect `(x, y, w, h)` outward by `pad_px` on all four sides to obtain
+/// the physical pin window rect while keeping the image anchored at `(x, y)`.
+pub fn pin_window_rect_from_image_rect(
+    image_rect: (i32, i32, u32, u32),
+    pad_px: i32,
+) -> (i32, i32, u32, u32) {
+    let pad = pad_px.max(0);
+    let pad_u = pad as u32;
+    (
+        image_rect.0 - pad,
+        image_rect.1 - pad,
+        image_rect.2.saturating_add(pad_u.saturating_mul(2)),
+        image_rect.3.saturating_add(pad_u.saturating_mul(2)),
+    )
+}
+
+/// Inset a physical pin window rect `(x, y, w, h)` by `pad_px` on all four sides to recover the
+/// physical image rect.
+pub fn pin_image_rect_from_window_rect(
+    window_rect: (i32, i32, i32, i32),
+    pad_px: i32,
+) -> (i32, i32, i32, i32) {
+    let max_pad_x = ((window_rect.2 - 1) / 2).max(0);
+    let max_pad_y = ((window_rect.3 - 1) / 2).max(0);
+    let px = pad_px.max(0).min(max_pad_x);
+    let py = pad_px.max(0).min(max_pad_y);
+    (
+        window_rect.0 + px,
+        window_rect.1 + py,
+        (window_rect.2 - px * 2).max(1),
+        (window_rect.3 - py * 2).max(1),
+    )
+}
+
+/// Logical image rect inside a layered pin window, snapped to exact integer physical shadow padding
+/// so 100%-scale captures map 1:1 to screen pixels with zero subpixel blur.
+pub fn pin_image_rect_logical(screen: Rect, pixels_per_point: f32) -> Rect {
+    let ppp = pixels_per_point.max(0.5);
+    let pad = pin_shadow_pad_physical(ppp as f64) as f32 / ppp;
+    let max_pad_x = ((screen.width() - 4.0) * 0.5).max(0.0);
+    let max_pad_y = ((screen.height() - 4.0) * 0.5).max(0.0);
+    let px = pad.min(max_pad_x);
+    let py = pad.min(max_pad_y);
+    Rect::from_min_max(
+        Pos2::new(screen.min.x + px, screen.min.y + py),
+        Pos2::new(screen.max.x - px, screen.max.y - py),
+    )
+}
 
 /// Compute initial physical `(x, y, width, height)` for a pin image window.
 ///
@@ -177,6 +238,8 @@ pub struct PinUiFeedback {
     pub hide_toolbar: bool,
     /// Explicit visibility change requested for the right-side plain-text panel.
     pub text_panel_visible: Option<bool>,
+    /// Global layered-window alpha (0..=255) updated from the toolbar opacity slider.
+    pub opacity_changed: Option<u8>,
 }
 
 /// Cross-block character selection inside a text-overlay pin window.
@@ -728,6 +791,33 @@ impl PinWindowState {
         false
     }
 
+    /// Dismiss the active overlay error banner; if no recognized text exists yet (e.g. blank page),
+    /// also close the companion plain-text panel and return the pin to normal mode.
+    pub fn dismiss_overlay_error(&mut self, fb: &mut PinUiFeedback) -> bool {
+        let has_err = self
+            .text_overlay
+            .as_ref()
+            .is_some_and(|ov| !ov.busy && ov.error.is_some());
+        if !has_err {
+            return false;
+        }
+        let no_data = self
+            .text_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.data.is_none());
+        if no_data {
+            self.text_overlay = None;
+            fb.text_panel_visible = Some(false);
+            fb.geometry_changed = true;
+            fb.redraw_toolbar = true;
+        } else if let Some(ov) = self.text_overlay.as_mut() {
+            ov.error = None;
+        }
+        fb.redraw_image = true;
+        fb.redraw_text_panel = true;
+        true
+    }
+
     pub fn set_message(&mut self, text: impl Into<String>) {
         self.message = Some((text.into(), Instant::now() + Duration::from_secs(4)));
     }
@@ -811,6 +901,8 @@ impl PinWindowState {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             if self.close_lang_picker() {
                 fb.redraw_toolbar = true;
+            } else if self.dismiss_overlay_error(&mut fb) {
+                ctx.request_repaint();
             } else {
                 app.emit(AppEvent::ClosePin {
                     pin_id: self.pin_id.clone(),
@@ -868,6 +960,7 @@ impl PinWindowState {
         }
 
         let screen = ctx.screen_rect();
+        let image_rect = pin_image_rect_logical(screen, ctx.pixels_per_point());
         let palette = crate::ui::ctx_palette(ctx);
 
         // Mouse wheel zoom.
@@ -875,7 +968,12 @@ impl PinWindowState {
             let scroll_y = ctx.input(|i| i.smooth_scroll_delta.y);
             if scroll_y.abs() > 0.5 {
                 let delta = if scroll_y > 0.0 { 10 } else { -10 };
-                if self.apply_zoom(app, hwnd, (self.scale + delta).clamp(25, 200)) {
+                if self.apply_zoom(
+                    app,
+                    hwnd,
+                    (self.scale + delta).clamp(25, 200),
+                    window.scale_factor(),
+                ) {
                     fb.geometry_changed = true;
                 }
             }
@@ -887,6 +985,9 @@ impl PinWindowState {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
+                // 0. Draw soft elevation shadow extending outward on all four sides around the image.
+                paint_pin_shadow(ui.painter(), image_rect);
+
                 // 1. Draw base image (or animated GIF when text overlay is not active).
                 if !freeze_gif {
                     if let Some(player) = self.gif_player.as_mut() {
@@ -895,7 +996,7 @@ impl PinWindowState {
                         {
                             ui.painter().image(
                                 tex.id(),
-                                screen,
+                                image_rect,
                                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                                 Color32::WHITE,
                             );
@@ -903,7 +1004,7 @@ impl PinWindowState {
                     } else if let Some(tex) = &self.texture {
                         ui.painter().image(
                             tex.id(),
-                            screen,
+                            image_rect,
                             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                             Color32::WHITE,
                         );
@@ -911,7 +1012,7 @@ impl PinWindowState {
                 } else if let Some(tex) = &self.texture {
                     ui.painter().image(
                         tex.id(),
-                        screen,
+                        image_rect,
                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
@@ -923,7 +1024,7 @@ impl PinWindowState {
                 });
 
                 if has_positioned {
-                    let rendered = self.build_rendered_blocks(ui.painter(), screen);
+                    let rendered = self.build_rendered_blocks(ui.painter(), image_rect);
                     let resp = ui.allocate_rect(screen, Sense::click_and_drag());
                     let pointer_pos =
                         ui.input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
@@ -935,14 +1036,7 @@ impl PinWindowState {
 
                     let hovered_block_idx = if resp.hovered() && !alt_down {
                         pointer_pos.and_then(|pos| {
-                            if is_near_window_edge(screen, pos) {
-                                None
-                            } else {
-                                rendered
-                                    .iter()
-                                    .find(|b| b.hit_rect.contains(pos))
-                                    .map(|b| b.idx)
-                            }
+                            hit_text_block(&rendered, image_rect, pos).map(|b| b.idx)
                         })
                     } else {
                         None
@@ -973,8 +1067,7 @@ impl PinWindowState {
                     // double-click empty image follows normal pin double-click behavior.
                     if resp.double_clicked() {
                         if let Some(pos) = resp.interact_pointer_pos() {
-                            if let Some(block) = rendered.iter().find(|b| b.hit_rect.contains(pos))
-                            {
+                            if let Some(block) = hit_text_block(&rendered, image_rect, pos) {
                                 if let Some(ov) = self.text_overlay.as_mut() {
                                     ov.selection = Some(TextSelection {
                                         anchor: (block.idx, 0),
@@ -998,8 +1091,8 @@ impl PinWindowState {
                     }
 
                     // Drag handling:
-                    // - Middle drag, Alt+Primary drag, edge drag, or drag starting outside text blocks -> move window.
-                    // - Primary drag starting on a text block -> select text across one or more blocks.
+                    // - Middle drag, Alt+Primary drag, outer shadow rim drag, or drag starting outside text blocks -> move window.
+                    // - Primary drag starting on (or right beside) a text block -> select text across one or more blocks.
                     let middle_started = resp.drag_started_by(egui::PointerButton::Middle);
                     let primary_started = resp.drag_started_by(egui::PointerButton::Primary);
                     if middle_started {
@@ -1010,14 +1103,8 @@ impl PinWindowState {
                             None
                         } else {
                             start_pos.and_then(|pos| {
-                                if is_near_window_edge(screen, pos) {
-                                    None
-                                } else {
-                                    rendered
-                                        .iter()
-                                        .find(|b| b.hit_rect.contains(pos))
-                                        .map(|b| (b.idx, b.char_index_at(pos, is_ocr)))
-                                }
+                                hit_text_block(&rendered, image_rect, pos)
+                                    .map(|b| (b.idx, b.char_index_at(pos, is_ocr)))
                             })
                         };
                         if let Some(anchor) = hit {
@@ -1332,7 +1419,7 @@ impl PinWindowState {
             }
         }
 
-        // 6. Error banner with quick Retry / Provider Settings action when overlay processing failed.
+        // 6. Error banner with quick Retry / Provider Settings / Close action when overlay processing failed.
         if let Some(err_text) = self
             .text_overlay
             .as_ref()
@@ -1342,45 +1429,86 @@ impl PinWindowState {
             let mut retry_mode: Option<PinOverlayMode> = None;
             let mut open_settings = false;
             let mut dismiss_err = false;
+            let dark = ctx.style().visuals.dark_mode;
+            let card_bg = if dark {
+                Color32::from_rgba_unmultiplied(
+                    palette.dark_window.r(),
+                    palette.dark_window.g(),
+                    palette.dark_window.b(),
+                    245,
+                )
+            } else {
+                Color32::from_rgba_unmultiplied(0xfc, 0xfd, 0xfd, 248)
+            };
             egui::Area::new(egui::Id::new(format!("pin_err_{}", self.pin_id)))
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
-                    let max_w = (screen.width() - 24.0).clamp(180.0, 340.0);
+                    let max_w = (screen.width() - 16.0).clamp(120.0, 340.0);
                     egui::Frame::NONE
-                        .fill(palette.floating_bg_alpha(242))
-                        .stroke(Stroke::new(1.0_f32, ui::DANGER))
+                        .fill(card_bg)
+                        .stroke(Stroke::new(1.2_f32, ui::DANGER))
                         .corner_radius(CornerRadius::same(8))
-                        .inner_margin(egui::Margin::symmetric(12, 10))
+                        .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
                             ui.set_max_width(max_w);
-                            ui.label(RichText::new(err_text).color(Color32::WHITE).small());
+                            ui.horizontal(|ui| {
+                                icons::paint_inline(ui, Icon::Alert, 14.0, ui::DANGER);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Min),
+                                    |ui| {
+                                        if icons::small_icon_button(ui, Icon::Close)
+                                            .on_hover_text(i18n::t("Close"))
+                                            .clicked()
+                                        {
+                                            dismiss_err = true;
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Min),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(err_text).small(),
+                                                    )
+                                                    .wrap(),
+                                                );
+                                            },
+                                        );
+                                    },
+                                );
+                            });
                             ui.add_space(6.0);
                             ui.horizontal_wrapped(|ui| {
-                                if icons::dark_icon_text_button(
+                                if icons::small_icon_text_button(
                                     ui,
                                     Icon::Reselect,
                                     i18n::t("Retry"),
-                                    palette.accent,
-                                    palette.accent_hover,
+                                    false,
+                                    true,
                                 )
                                 .clicked()
                                 {
                                     retry_mode = self.text_overlay.as_ref().map(|o| o.mode);
                                 }
-                                if icons::dark_icon_text_button(
+                                if icons::small_icon_text_button(
                                     ui,
                                     Icon::SettingsGeneral,
                                     i18n::t("Provider Settings"),
-                                    palette.floating_btn,
-                                    palette.floating_btn_hover,
+                                    false,
+                                    false,
                                 )
                                 .clicked()
                                 {
                                     open_settings = true;
                                 }
-                                if icons::dark_icon_button(ui, Icon::Close, i18n::t("Close"))
-                                    .clicked()
+                                if icons::small_icon_text_button(
+                                    ui,
+                                    Icon::Close,
+                                    i18n::t("Close"),
+                                    false,
+                                    false,
+                                )
+                                .clicked()
                                 {
                                     dismiss_err = true;
                                 }
@@ -1389,6 +1517,7 @@ impl PinWindowState {
                 });
             if let Some(mode) = retry_mode {
                 self.trigger_overlay_mode(app, mode, true);
+                fb.redraw_image = true;
                 fb.redraw_toolbar = true;
                 fb.redraw_text_panel = true;
             }
@@ -1398,17 +1527,16 @@ impl PinWindowState {
                 });
             }
             if dismiss_err {
-                if let Some(ov) = self.text_overlay.as_mut() {
-                    ov.error = None;
-                }
-                fb.redraw_text_panel = true;
+                self.dismiss_overlay_error(&mut fb);
+                ctx.request_repaint();
             }
         }
 
         // 7. Inline toast message.
         if let Some((msg, _)) = &self.message {
+            let top_offset = (image_rect.min.y - screen.min.y) + 8.0;
             egui::Area::new(egui::Id::new(format!("pin_msg_{}", self.pin_id)))
-                .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 8.0))
+                .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, top_offset))
                 .order(egui::Order::Tooltip)
                 .interactable(false)
                 .show(ctx, |ui| {
@@ -1422,7 +1550,7 @@ impl PinWindowState {
                 });
         }
 
-        fb.keep_toolbar_open = self.lang_picker_open();
+        fb.keep_toolbar_open = self.lang_picker_open() || self.passthrough;
         fb
     }
 
@@ -1441,6 +1569,7 @@ impl PinWindowState {
         ctx: &egui::Context,
         app: &Arc<App>,
         pin_hwnd: Option<isize>,
+        pin_scale_factor: f64,
         picker_above: bool,
     ) -> PinUiFeedback {
         let mut fb = PinUiFeedback::default();
@@ -1459,6 +1588,17 @@ impl PinWindowState {
         }
 
         let palette = ui::ctx_palette(ctx);
+        let dark = ctx.style().visuals.dark_mode;
+        let bar_bg = if dark {
+            palette.dark_window
+        } else {
+            Color32::from_rgb(0xfc, 0xfd, 0xfd)
+        };
+        let border_color = if dark {
+            palette.dark_stroke
+        } else {
+            palette.light_stroke
+        };
         let is_overlay = self.is_text_overlay();
         let picker_open = self.lang_picker_open();
 
@@ -1480,8 +1620,8 @@ impl PinWindowState {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::NONE
-                    .fill(palette.floating_bg)
-                    .stroke(Stroke::new(1.0_f32, palette.dark_stroke))
+                    .fill(bar_bg)
+                    .stroke(Stroke::new(1.0_f32, border_color))
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(8, 5)),
             )
@@ -1563,7 +1703,7 @@ impl PinWindowState {
                             .map(|o| (o.mode, o.show_layer, o.show_text_panel, o.busy))
                             .unwrap();
 
-                        if icons::dark_icon_button_active(
+                        if toolbar_icon_button(
                             ui,
                             Icon::Ocr,
                             i18n::t("Extract Text"),
@@ -1575,7 +1715,7 @@ impl PinWindowState {
                             activate_mode = Some((PinOverlayMode::Ocr, false));
                         }
 
-                        if icons::dark_icon_button_active(
+                        if toolbar_icon_button(
                             ui,
                             Icon::Translate,
                             i18n::t("Translate"),
@@ -1588,14 +1728,16 @@ impl PinWindowState {
                         }
 
                         let short_code = cur_tgt_code.to_ascii_uppercase();
-                        if dark_lang_button(ui, &short_code, picker_open)
+                        if toolbar_lang_button(ui, &short_code, picker_open)
                             .on_hover_text(i18n::t("Target Language"))
                             .clicked()
                         {
                             toggled_picker = true;
                         }
 
-                        if icons::dark_icon_button(ui, Icon::Copy, i18n::t("Copy Text")).clicked() {
+                        if toolbar_icon_button(ui, Icon::Copy, i18n::t("Copy Text"), false)
+                            .clicked()
+                        {
                             let text = self.text_overlay.as_ref().and_then(|ov| {
                                 ov.selected_text().or_else(|| {
                                     let all = ov.active_full_text();
@@ -1613,7 +1755,7 @@ impl PinWindowState {
                             fb.redraw_image = true;
                         }
 
-                        if icons::dark_icon_button_active(
+                        if toolbar_icon_button(
                             ui,
                             if show_layer { Icon::Eye } else { Icon::EyeOff },
                             if show_layer {
@@ -1633,9 +1775,10 @@ impl PinWindowState {
                                 }
                             }
                             fb.redraw_image = true;
+                            fb.redraw_toolbar = true;
                         }
 
-                        if icons::dark_icon_button_active(
+                        if toolbar_icon_button(
                             ui,
                             Icon::TextPanel,
                             if show_panel {
@@ -1647,33 +1790,43 @@ impl PinWindowState {
                         )
                         .clicked()
                         {
-                            if let Some(ov) = self.text_overlay.as_mut() {
+                            let hiding_error_without_data = self.text_overlay.as_ref().is_some_and(
+                                |ov| ov.show_text_panel && ov.error.is_some() && ov.data.is_none(),
+                            );
+                            if hiding_error_without_data {
+                                self.dismiss_overlay_error(&mut fb);
+                            } else if let Some(ov) = self.text_overlay.as_mut() {
                                 ov.show_text_panel = !ov.show_text_panel;
                                 fb.text_panel_visible = Some(ov.show_text_panel);
+                                if ov.show_text_panel {
+                                    fb.redraw_text_panel = true;
+                                }
+                                fb.redraw_toolbar = true;
                             }
-                            fb.redraw_text_panel = true;
                         }
                     } else {
                         // Standard pin toolbar actions.
-                        if icons::dark_icon_button(ui, Icon::Copy, i18n::t("Copy")).clicked() {
+                        if toolbar_icon_button(ui, Icon::Copy, i18n::t("Copy"), false).clicked() {
                             match service::copy_image(app, &self.capture_id) {
                                 Ok(()) => self.set_message(i18n::t("Copied")),
                                 Err(e) => self.set_message(e),
                             }
                             fb.redraw_image = true;
                         }
-                        if icons::dark_icon_button(ui, Icon::Save, i18n::t("Edit & Save")).clicked()
+                        if toolbar_icon_button(ui, Icon::Save, i18n::t("Edit & Save"), false)
+                            .clicked()
                         {
                             if let Err(e) = service::open_result(app, &self.capture_id) {
                                 self.set_message(e);
                                 fb.redraw_image = true;
                             }
                         }
-                        if icons::dark_icon_button(ui, Icon::Ocr, i18n::t("Extract Text")).clicked()
+                        if toolbar_icon_button(ui, Icon::Ocr, i18n::t("Extract Text"), false)
+                            .clicked()
                         {
                             activate_mode = Some((PinOverlayMode::Ocr, false));
                         }
-                        if icons::dark_icon_button(ui, Icon::Translate, i18n::t("Translate"))
+                        if toolbar_icon_button(ui, Icon::Translate, i18n::t("Translate"), false)
                             .clicked()
                         {
                             activate_mode = Some((PinOverlayMode::Translation, false));
@@ -1681,7 +1834,8 @@ impl PinWindowState {
                     }
 
                     if is_overlay
-                        && icons::dark_icon_button(ui, Icon::Save, i18n::t("Edit & Save")).clicked()
+                        && toolbar_icon_button(ui, Icon::Save, i18n::t("Edit & Save"), false)
+                            .clicked()
                     {
                         if let Err(e) = service::open_result(app, &self.capture_id) {
                             self.set_message(e);
@@ -1689,36 +1843,57 @@ impl PinWindowState {
                         }
                     }
 
-                    if icons::dark_icon_button(ui, Icon::ZoomOut, i18n::t("Zoom Out")).clicked()
-                        && self.apply_zoom(app, pin_hwnd, (self.scale - 10).clamp(25, 200))
+                    if toolbar_icon_button(ui, Icon::ZoomOut, i18n::t("Zoom Out"), false).clicked()
+                        && self.apply_zoom(
+                            app,
+                            pin_hwnd,
+                            (self.scale - 10).clamp(25, 200),
+                            pin_scale_factor,
+                        )
                     {
                         fb.geometry_changed = true;
                         fb.redraw_image = true;
                     }
-                    if icons::dark_icon_button(ui, Icon::ZoomIn, i18n::t("Zoom In")).clicked()
-                        && self.apply_zoom(app, pin_hwnd, (self.scale + 10).clamp(25, 200))
+                    if toolbar_icon_button(ui, Icon::ZoomIn, i18n::t("Zoom In"), false).clicked()
+                        && self.apply_zoom(
+                            app,
+                            pin_hwnd,
+                            (self.scale + 10).clamp(25, 200),
+                            pin_scale_factor,
+                        )
                     {
                         fb.geometry_changed = true;
                         fb.redraw_image = true;
                     }
-                    if icons::dark_icon_button(
+                    if toolbar_icon_button(
                         ui,
                         Icon::Passthrough,
-                        i18n::t("Enable click-through (press Show/Hide Pins shortcut to restore)"),
+                        if self.passthrough {
+                            i18n::t("Disable click-through")
+                        } else {
+                            i18n::t("Enable click-through")
+                        },
+                        self.passthrough,
                     )
                     .clicked()
                     {
                         if let Some(h) = pin_hwnd {
-                            native::set_window_click_through(h, true);
-                            self.passthrough = true;
+                            let next = !self.passthrough;
+                            native::set_window_click_through(h, next);
+                            self.passthrough = next;
+                            self.drag_origin = None;
                             if let Some(ps) = app.core.lock().unwrap().pins.get_mut(&self.pin_id) {
-                                ps.passthrough = true;
+                                ps.passthrough = next;
                             }
-                            self.set_message(i18n::t(
-                                "Click-through enabled; press the Show/Hide Pins shortcut to restore",
-                            ));
-                            fb.hide_toolbar = true;
+                            if next {
+                                self.set_message(i18n::t(
+                                    "Click-through enabled; click again or press Show/Hide Pins shortcut to restore",
+                                ));
+                            } else {
+                                self.set_message(i18n::t("Click-through disabled"));
+                            }
                             fb.redraw_image = true;
+                            fb.redraw_toolbar = true;
                         }
                     }
 
@@ -1734,13 +1909,14 @@ impl PinWindowState {
                         .changed()
                     {
                         self.opacity = op;
-                        if let Some(h) = pin_hwnd {
-                            let _ =
-                                native::set_window_opacity(h, ((op as u32) * 255 / 100) as u8);
+                        if let Some(ps) = app.core.lock().unwrap().pins.get_mut(&self.pin_id) {
+                            ps.opacity = op;
                         }
+                        fb.opacity_changed = Some(((op as u32) * 255 / 100) as u8);
                     }
 
-                    if icons::dark_icon_button(ui, Icon::Close, i18n::t("Close Pin Esc")).clicked()
+                    if toolbar_icon_button(ui, Icon::Close, i18n::t("Close Pin Esc"), false)
+                        .clicked()
                     {
                         app.emit(AppEvent::ClosePin {
                             pin_id: self.pin_id.clone(),
@@ -1813,7 +1989,7 @@ impl PinWindowState {
         }
 
         fb.toolbar_bar_size = Some(measured_bar);
-        fb.keep_toolbar_open = self.lang_picker_open();
+        fb.keep_toolbar_open = self.lang_picker_open() || self.passthrough;
         fb
     }
 
@@ -1836,13 +2012,15 @@ impl PinWindowState {
             }
         }
 
-        // Pressing Esc inside the plain-text panel hides the panel (keeps the pin open).
+        // Pressing Esc inside the plain-text panel hides the panel (and clears error if blank page).
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if let Some(ov) = self.text_overlay.as_mut() {
-                ov.show_text_panel = false;
+            if !self.dismiss_overlay_error(&mut fb) {
+                if let Some(ov) = self.text_overlay.as_mut() {
+                    ov.show_text_panel = false;
+                }
+                fb.text_panel_visible = Some(false);
+                fb.redraw_toolbar = true;
             }
-            fb.text_panel_visible = Some(false);
-            fb.redraw_toolbar = true;
             return fb;
         }
 
@@ -1877,10 +2055,11 @@ impl PinWindowState {
                     .corner_radius(CornerRadius::same(8)),
             )
             .show(ctx, |ui| {
-                // Header bar (draggable to adjust relative position).
+                // Header bar (empty space between left & right buttons is draggable without shadowing buttons).
                 let header_frame = egui::Frame::NONE
                     .fill(header_bg)
                     .inner_margin(egui::Margin::symmetric(10, 7));
+                let mut header_drag_rect: Option<Rect> = None;
                 let header_resp = header_frame.show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(5.0, 0.0);
@@ -1932,26 +2111,43 @@ impl PinWindowState {
                             {
                                 copy_requested = true;
                             }
+                            let gap = ui.available_rect_before_wrap();
+                            if gap.width() >= 4.0 && gap.height() >= 4.0 {
+                                header_drag_rect = Some(gap);
+                            }
                         });
                     });
                 });
 
-                // Dragging empty area of the header adjusts the panel's relative offset.
-                let drag_resp = ui.interact(
-                    header_resp.response.rect,
-                    egui::Id::new(format!("pin_panel_hdr_drag_{}", self.pin_id)),
-                    Sense::drag(),
-                );
-                if drag_resp.drag_started_by(egui::PointerButton::Primary) {
-                    self.panel_drag_origin = Some((native::cursor_pos(), self.text_panel_offset));
-                } else if drag_resp.dragged_by(egui::PointerButton::Primary) {
-                    if let Some((c0, off0)) = self.panel_drag_origin {
-                        let c1 = native::cursor_pos();
-                        self.text_panel_offset = (off0.0 + (c1.0 - c0.0), off0.1 + (c1.1 - c0.1));
-                        fb.geometry_changed = true;
+                // Dragging the empty middle gap of the header adjusts the panel's relative offset.
+                if let Some(gap) = header_drag_rect {
+                    let drag_area = Rect::from_min_max(
+                        Pos2::new(gap.min.x, header_resp.response.rect.min.y),
+                        Pos2::new(gap.max.x, header_resp.response.rect.max.y),
+                    );
+                    let drag_resp = ui.interact(
+                        drag_area,
+                        egui::Id::new(format!("pin_panel_hdr_drag_{}", self.pin_id)),
+                        Sense::drag(),
+                    );
+                    if drag_resp.hovered() && self.panel_drag_origin.is_none() {
+                        ctx.set_cursor_icon(CursorIcon::Grab);
                     }
-                } else if drag_resp.drag_stopped() {
-                    self.panel_drag_origin = None;
+                    if drag_resp.drag_started_by(egui::PointerButton::Primary) {
+                        self.panel_drag_origin =
+                            Some((native::cursor_pos(), self.text_panel_offset));
+                        ctx.set_cursor_icon(CursorIcon::Grabbing);
+                    } else if drag_resp.dragged_by(egui::PointerButton::Primary) {
+                        if let Some((c0, off0)) = self.panel_drag_origin {
+                            let c1 = native::cursor_pos();
+                            self.text_panel_offset =
+                                (off0.0 + (c1.0 - c0.0), off0.1 + (c1.1 - c0.1));
+                            fb.geometry_changed = true;
+                        }
+                        ctx.set_cursor_icon(CursorIcon::Grabbing);
+                    } else if drag_resp.drag_stopped() {
+                        self.panel_drag_origin = None;
+                    }
                 }
 
                 ui.painter().line_segment(
@@ -1990,7 +2186,15 @@ impl PinWindowState {
                             });
                         } else if let Some(err) = ov.error.clone() {
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(err).color(ui::DANGER).small());
+                                ui.horizontal(|ui| {
+                                    icons::paint_inline(ui, Icon::Alert, 14.0, ui::DANGER);
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(err).color(ui::DANGER).small(),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
                                 ui.add_space(8.0);
                                 ui.horizontal_wrapped(|ui| {
                                     if icons::icon_text_button(
@@ -2016,6 +2220,18 @@ impl PinWindowState {
                                     .clicked()
                                     {
                                         open_settings = true;
+                                    }
+                                    if icons::icon_text_button(
+                                        ui,
+                                        Icon::Close,
+                                        i18n::t("Close"),
+                                        false,
+                                        false,
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        close_panel = true;
                                     }
                                 });
                             });
@@ -2086,11 +2302,13 @@ impl PinWindowState {
             });
 
         if close_panel {
-            if let Some(ov) = self.text_overlay.as_mut() {
-                ov.show_text_panel = false;
+            if !self.dismiss_overlay_error(&mut fb) {
+                if let Some(ov) = self.text_overlay.as_mut() {
+                    ov.show_text_panel = false;
+                }
+                fb.text_panel_visible = Some(false);
+                fb.redraw_toolbar = true;
             }
-            fb.text_panel_visible = Some(false);
-            fb.redraw_toolbar = true;
         } else if copy_requested {
             if let Some(ov) = self.text_overlay.as_mut() {
                 let text = ov.active_full_text();
@@ -2229,16 +2447,33 @@ impl PinWindowState {
         false
     }
 
-    fn apply_zoom(&mut self, app: &App, hwnd: Option<isize>, next_scale: i64) -> bool {
+    /// Target physical outer window size (image size at current zoom + shadow padding on all sides).
+    pub fn target_window_size_physical(&self, scale_factor: f64) -> (i32, i32) {
+        let pad_px = pin_shadow_pad_physical(scale_factor);
+        let img_w = ((self.base_width as i64 * self.scale) / 100).max(40) as i32;
+        let img_h = ((self.base_height as i64 * self.scale) / 100).max(40) as i32;
+        (img_w + pad_px * 2, img_h + pad_px * 2)
+    }
+
+    pub fn sync_window_size_for_scale(&self, hwnd: Option<isize>, scale_factor: f64) {
+        if let Some(h) = hwnd {
+            let (nw, nh) = self.target_window_size_physical(scale_factor);
+            native::resize_window_physical(h, nw, nh);
+        }
+    }
+
+    fn apply_zoom(
+        &mut self,
+        app: &App,
+        hwnd: Option<isize>,
+        next_scale: i64,
+        scale_factor: f64,
+    ) -> bool {
         if next_scale == self.scale {
             return false;
         }
         self.scale = next_scale;
-        let nw = ((self.base_width as i64 * next_scale) / 100).max(40) as i32;
-        let nh = ((self.base_height as i64 * next_scale) / 100).max(40) as i32;
-        if let Some(h) = hwnd {
-            native::resize_window_physical(h, nw, nh);
-        }
+        self.sync_window_size_for_scale(hwnd, scale_factor);
         if let Some(ps) = app.core.lock().unwrap().pins.get_mut(&self.pin_id) {
             ps.scale = next_scale;
         }
@@ -2509,12 +2744,88 @@ pub fn current_lang_key(settings: &serde_json::Value) -> String {
     format!("{}->{}", src, tgt)
 }
 
-fn is_near_window_edge(screen: Rect, pos: Pos2) -> bool {
-    let border = 5.0;
-    pos.x <= screen.min.x + border
-        || pos.x >= screen.max.x - border
-        || pos.y <= screen.min.y + border
-        || pos.y >= screen.max.y - border
+/// Paint a soft, multi-layer elevation drop shadow extending slightly outward on all four sides
+/// around `image_rect`, plus a subtle 1px outer hairline so the pinned image clearly separates
+/// from both light and pure-dark underlying screens without covering any pixels of the image.
+fn paint_pin_shadow(painter: &egui::Painter, image_rect: Rect) {
+    let layers = [
+        // Wide ambient shadow (left/right: 10pt, top: 9pt, bottom: 11pt — fades cleanly to alpha=0
+        // before the 12pt window edge so there is never a visible rectangular cutoff).
+        egui::Shadow {
+            offset: [0, 1],
+            blur: 12,
+            spread: 4,
+            color: Color32::from_black_alpha(38),
+        },
+        // Mid soft shadow (left/right: 6pt, top: 5pt, bottom: 7pt).
+        egui::Shadow {
+            offset: [0, 1],
+            blur: 10,
+            spread: 1,
+            color: Color32::from_black_alpha(54),
+        },
+        // Crisp contact shadow right around all four edges of the pinned image.
+        egui::Shadow {
+            offset: [0, 0],
+            blur: 4,
+            spread: 0,
+            color: Color32::from_black_alpha(84),
+        },
+    ];
+    for shadow in layers {
+        painter.add(shadow.as_shape(image_rect, CornerRadius::same(1)));
+    }
+    // Subtle 1px outer rim strictly outside `image_rect` so the pin boundary stays legible over
+    // pure-black backgrounds as well.
+    painter.rect_stroke(
+        image_rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 42)),
+        egui::StrokeKind::Outside,
+    );
+}
+
+fn rect_distance_sq(rect: Rect, pos: Pos2) -> f32 {
+    let dx = if pos.x < rect.min.x {
+        rect.min.x - pos.x
+    } else if pos.x > rect.max.x {
+        pos.x - rect.max.x
+    } else {
+        0.0
+    };
+    let dy = if pos.y < rect.min.y {
+        rect.min.y - pos.y
+    } else if pos.y > rect.max.y {
+        pos.y - rect.max.y
+    } else {
+        0.0
+    };
+    dx * dx + dy * dy
+}
+
+/// Edge-friendly text block hit-testing:
+/// 1. Exact hits inside a block's `hit_rect` always win (even flush against the image edge).
+/// 2. Otherwise, within a small 5pt horizontal / 2.5pt vertical assist margin (clamped inside
+///    `image_rect.expand(5.0)` so the outer portion of the shadow halo stays a pure drag handle),
+///    select the closest text block so users can easily start selecting edge characters from
+///    slightly outside the image boundary.
+fn hit_text_block<'a>(
+    rendered: &'a [RenderedBlock],
+    image_rect: Rect,
+    pos: Pos2,
+) -> Option<&'a RenderedBlock> {
+    if let Some(exact) = rendered.iter().find(|b| b.hit_rect.contains(pos)) {
+        return Some(exact);
+    }
+    const ASSIST_X: f32 = 5.0;
+    const ASSIST_Y: f32 = 2.5;
+    if !image_rect.expand(ASSIST_X).contains(pos) {
+        return None;
+    }
+    rendered
+        .iter()
+        .filter(|b| b.hit_rect.expand2(Vec2::new(ASSIST_X, ASSIST_Y)).contains(pos))
+        .min_by(|a, b| rect_distance_sq(a.hit_rect, pos).total_cmp(&rect_distance_sq(b.hit_rect, pos)))
 }
 
 fn nearest_text_cursor(
@@ -2572,7 +2883,11 @@ fn nearest_text_cursor(
     Some((best.idx, best.char_index_at(clamped, is_ocr)))
 }
 
-fn dark_lang_button(ui: &mut egui::Ui, label: &str, open: bool) -> egui::Response {
+fn toolbar_icon_button(ui: &mut egui::Ui, icon: Icon, tip: &str, active: bool) -> egui::Response {
+    icons::icon_button_sized(ui, icon, Vec2::splat(26.0), 14.5, active, false).on_hover_text(tip)
+}
+
+fn toolbar_lang_button(ui: &mut egui::Ui, label: &str, open: bool) -> egui::Response {
     let font_id = FontId::proportional(11.5);
     let galley = ui
         .painter()
@@ -2581,16 +2896,40 @@ fn dark_lang_button(ui: &mut egui::Ui, label: &str, open: bool) -> egui::Respons
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 26.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let palette = ui::ctx_palette(ui.ctx());
-        let fill = if open {
-            palette.accent
+        let visuals = ui.visuals();
+        let (fill, stroke, fg) = if open {
+            (
+                if resp.hovered() {
+                    palette.accent_hover
+                } else {
+                    palette.accent
+                },
+                Stroke::new(1.0_f32, palette.accent_hover),
+                Color32::WHITE,
+            )
         } else if resp.hovered() {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 48)
+            (
+                visuals.widgets.hovered.bg_fill,
+                visuals.widgets.hovered.bg_stroke,
+                visuals.strong_text_color(),
+            )
         } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+            (
+                visuals.widgets.inactive.bg_fill,
+                visuals.widgets.inactive.bg_stroke,
+                visuals.text_color(),
+            )
         };
-        ui.painter().rect_filled(rect, CornerRadius::same(5), fill);
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(5),
+            fill,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
         let text_pos = Pos2::new(rect.min.x + 6.0, rect.center().y - galley.size().y * 0.5);
-        ui.painter().galley(text_pos, galley, Color32::WHITE);
+        ui.painter()
+            .galley_with_override_text_color(text_pos, galley, fg);
         let arrow_rect = Rect::from_center_size(
             Pos2::new(rect.max.x - 8.5, rect.center().y),
             Vec2::splat(9.5),
@@ -2603,7 +2942,7 @@ fn dark_lang_button(ui: &mut egui::Ui, label: &str, open: bool) -> egui::Respons
             } else {
                 Icon::ChevronDown
             },
-            Color32::WHITE,
+            fg,
         );
     }
     resp
@@ -2832,5 +3171,114 @@ mod tests {
                 }
             });
         });
+    }
+
+    #[test]
+    fn pin_shadow_padding_preserves_exact_image_origin_and_size() {
+        let pad_1x = pin_shadow_pad_physical(1.0);
+        assert_eq!(pad_1x, 12);
+        let win = pin_window_rect_from_image_rect((320, 180, 640, 400), pad_1x);
+        assert_eq!(win, (308, 168, 664, 424));
+        let recovered =
+            pin_image_rect_from_window_rect((win.0, win.1, win.2 as i32, win.3 as i32), pad_1x);
+        assert_eq!(recovered, (320, 180, 640, 400));
+
+        // 150% DPI scaling snaps to integer physical pixels (18px).
+        let pad_150 = pin_shadow_pad_physical(1.5);
+        assert_eq!(pad_150, 18);
+        let screen = Rect::from_min_max(Pos2::ZERO, Pos2::new(424.0, 224.0));
+        let img = pin_image_rect_logical(screen, 1.5);
+        assert!((img.min.x - 12.0).abs() < 0.001);
+        assert!((img.max.x - 412.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn edge_text_blocks_are_selectable_from_edge_and_inner_shadow_while_outer_rim_drags() {
+        let ctx = egui::Context::default();
+        let data = OcrOverlayData {
+            blocks: vec![OcrTextBlock {
+                // Flush against top-left and right edges of a 200x60 image.
+                rect: [0.0, 0.0, 200.0, 20.0],
+                row: 0,
+                text: "EdgeText".into(),
+                translated: None,
+                bg_rgb: [255, 255, 255],
+                fg_rgb: [20, 24, 28],
+            }],
+            full_text: "EdgeText".into(),
+            full_translated: None,
+        };
+        let screen = Rect::from_min_max(Pos2::ZERO, Pos2::new(224.0, 84.0));
+        let image_rect = pin_image_rect_logical(screen, 1.0);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let blocks = build_rendered_blocks_for_data(
+                    ui.painter(),
+                    image_rect,
+                    200,
+                    60,
+                    &data,
+                    PinOverlayMode::Ocr,
+                );
+                assert_eq!(blocks.len(), 1);
+
+                // Clicking right on the image's top-left pixel selects the edge block.
+                let edge_hit = hit_text_block(&blocks, image_rect, Pos2::new(12.0, 12.0));
+                assert!(edge_hit.is_some());
+
+                // Starting 3pt into the left shadow margin selects from character 0.
+                let left_assist = hit_text_block(&blocks, image_rect, Pos2::new(9.0, 20.0));
+                assert!(left_assist.is_some());
+                assert_eq!(left_assist.unwrap().char_index_at(Pos2::new(9.0, 20.0), true), 0);
+
+                // Starting 3pt into the right shadow margin selects from the last character.
+                let right_assist = hit_text_block(&blocks, image_rect, Pos2::new(215.0, 20.0));
+                assert!(right_assist.is_some());
+                assert_eq!(
+                    right_assist.unwrap().char_index_at(Pos2::new(215.0, 20.0), true),
+                    "EdgeText".chars().count()
+                );
+
+                // Outer shadow rim (8pt outside image_rect) does NOT steal window-drag.
+                assert!(hit_text_block(&blocks, image_rect, Pos2::new(4.0, 20.0)).is_none());
+                assert!(hit_text_block(&blocks, image_rect, Pos2::new(220.0, 20.0)).is_none());
+            });
+        });
+    }
+
+    #[test]
+    fn dismiss_overlay_error_closes_blank_page_panel_and_requests_image_redraw() {
+        let mut state = PinWindowState {
+            pin_id: "pin-test".into(),
+            capture_id: "cap-test".into(),
+            base_width: 300,
+            base_height: 200,
+            scale: 100,
+            opacity: 100,
+            passthrough: false,
+            double_click_close: false,
+            texture: None,
+            image_dirty: false,
+            gif_player: None,
+            drag_origin: None,
+            panel_drag_origin: None,
+            text_panel_offset: (0, 0),
+            message: None,
+            text_overlay: Some(PinTextOverlay::new(PinOverlayMode::Ocr, "auto->en".into())),
+        };
+        state.apply_overlay_result(
+            PinOverlayMode::Ocr,
+            "auto->en".into(),
+            Err("No text detected in the image".into()),
+        );
+        assert!(state.wants_text_panel());
+
+        let mut fb = PinUiFeedback::default();
+        assert!(state.dismiss_overlay_error(&mut fb));
+        assert!(state.text_overlay.is_none());
+        assert!(!state.wants_text_panel());
+        assert_eq!(fb.text_panel_visible, Some(false));
+        assert!(fb.redraw_image);
+        assert!(fb.redraw_toolbar);
     }
 }

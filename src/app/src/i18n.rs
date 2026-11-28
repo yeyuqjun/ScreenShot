@@ -21,9 +21,9 @@ pub enum AppLanguage {
 impl AppLanguage {
     pub fn from_setting(raw: &str) -> Self {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "system" => Self::System,
+            "en" | "en-us" | "en_us" => Self::En,
             "zh-cn" | "zh" | "zh_cn" | "zh-hans" => Self::ZhCn,
-            _ => Self::En,
+            _ => Self::System,
         }
     }
 
@@ -223,7 +223,7 @@ pub fn apply_settings(settings: &Value) -> EffectiveLanguage {
         .get("general")
         .and_then(|g| g.get("language"))
         .and_then(|v| v.as_str())
-        .unwrap_or("en");
+        .unwrap_or("system");
     set_language_from_str(raw)
 }
 
@@ -338,11 +338,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn language_setting_normalizes_and_defaults_to_english() {
-        assert_eq!(AppLanguage::from_setting(""), AppLanguage::En);
-        assert_eq!(AppLanguage::from_setting("en"), AppLanguage::En);
-        assert_eq!(AppLanguage::from_setting("unknown"), AppLanguage::En);
+    fn language_setting_normalizes_and_defaults_to_system() {
+        assert_eq!(AppLanguage::from_setting(""), AppLanguage::System);
+        assert_eq!(AppLanguage::from_setting("unknown"), AppLanguage::System);
         assert_eq!(AppLanguage::from_setting("system"), AppLanguage::System);
+        assert_eq!(AppLanguage::from_setting("en"), AppLanguage::En);
         assert_eq!(AppLanguage::from_setting("zh-CN"), AppLanguage::ZhCn);
         assert_eq!(AppLanguage::from_setting("zh"), AppLanguage::ZhCn);
     }

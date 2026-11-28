@@ -66,6 +66,25 @@ impl Tool {
     pub fn is_freehand(self) -> bool {
         matches!(self, Tool::Pen | Tool::Eraser)
     }
+
+    pub fn supports_fill(self) -> bool {
+        matches!(self, Tool::Rect | Tool::Ellipse)
+    }
+
+    pub fn is_layer_editable(self) -> bool {
+        !matches!(self, Tool::Select | Tool::Eraser)
+    }
+
+    pub fn is_box_shape(self) -> bool {
+        matches!(
+            self,
+            Tool::Rect | Tool::Ellipse | Tool::Mosaic | Tool::Highlighter
+        )
+    }
+
+    pub fn is_segment(self) -> bool {
+        matches!(self, Tool::Line | Tool::Arrow)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -74,13 +93,15 @@ pub struct Point {
     pub y: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stroke {
     pub id: String,
     pub tool: Tool,
     pub points: Vec<Point>,
     pub color: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_color: Option<String>,
     pub width: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -110,11 +131,95 @@ impl Stroke {
         };
         (self.opacity.unwrap_or(default_pct) / 100.0).clamp(0.05, 1.0)
     }
+
+    pub fn has_fill(&self) -> bool {
+        self.tool.supports_fill()
+            && self
+                .fill_color
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
+    }
+
+    /// Axis-aligned bounding box `(min_x, min_y, max_x, max_y)` in image coordinates.
+    pub fn bounds(&self) -> Option<(f32, f32, f32, f32)> {
+        if self.points.is_empty() {
+            return None;
+        }
+        match self.tool {
+            Tool::Text | Tool::Watermark => {
+                let (bx, by, bw, bh) = text_bounds(self);
+                let rot = self.rotation.unwrap_or(0.0);
+                let corners = [
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: bw, y: 0.0 },
+                    Point { x: bw, y: bh },
+                    Point { x: 0.0, y: bh },
+                ];
+                let mut min_x = f32::INFINITY;
+                let mut min_y = f32::INFINITY;
+                let mut max_x = f32::NEG_INFINITY;
+                let mut max_y = f32::NEG_INFINITY;
+                for c in corners {
+                    let r = rotate_point(c, rot);
+                    let wx = bx + r.x;
+                    let wy = by + r.y;
+                    min_x = min_x.min(wx);
+                    min_y = min_y.min(wy);
+                    max_x = max_x.max(wx);
+                    max_y = max_y.max(wy);
+                }
+                Some((min_x, min_y, max_x, max_y))
+            }
+            Tool::Number => {
+                let p = self.points[0];
+                let r = (self.width * 4.0).max(14.0);
+                Some((p.x - r, p.y - r, p.x + r, p.y + r))
+            }
+            _ => {
+                let mut min_x = f32::INFINITY;
+                let mut min_y = f32::INFINITY;
+                let mut max_x = f32::NEG_INFINITY;
+                let mut max_y = f32::NEG_INFINITY;
+                for p in &self.points {
+                    min_x = min_x.min(p.x);
+                    min_y = min_y.min(p.y);
+                    max_x = max_x.max(p.x);
+                    max_y = max_y.max(p.y);
+                }
+                Some((min_x, min_y, max_x, max_y))
+            }
+        }
+    }
+
+    /// Translate all control points by `(dx, dy)` while keeping them within image bounds
+    /// without distorting multi-point geometry.
+    pub fn translate(&mut self, dx: f32, dy: f32, img_w: f32, img_h: f32) {
+        if self.points.is_empty() {
+            return;
+        }
+        let mut min_x = f32::INFINITY;
+        let mut min_y = f32::INFINITY;
+        let mut max_x = f32::NEG_INFINITY;
+        let mut max_y = f32::NEG_INFINITY;
+        for p in &self.points {
+            min_x = min_x.min(p.x);
+            min_y = min_y.min(p.y);
+            max_x = max_x.max(p.x);
+            max_y = max_y.max(p.y);
+        }
+        let eff_dx = dx.clamp(-min_x, (img_w - max_x).max(-min_x));
+        let eff_dy = dy.clamp(-min_y, (img_h - max_y).max(-min_y));
+        for p in &mut self.points {
+            p.x = (p.x + eff_dx).clamp(0.0, img_w);
+            p.y = (p.y + eff_dy).clamp(0.0, img_h);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolOptions {
     pub color: String,
+    pub fill_color: Option<String>,
     pub width: f32,
     pub font_size: f32,
     pub font_family: String,
@@ -125,6 +230,7 @@ impl Default for ToolOptions {
     fn default() -> Self {
         Self {
             color: "#ef6656".into(),
+            fill_color: None,
             width: 3.0,
             font_size: 24.0,
             font_family: "Microsoft YaHei".into(),
@@ -147,6 +253,14 @@ impl ToolOptions {
                 .as_str()
                 .unwrap_or(if tool == Tool::Highlighter { "#f6ca45" } else { "#ef6656" })
                 .to_string(),
+            fill_color: if tool.supports_fill() {
+                node["fillColor"]
+                    .as_str()
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+            } else {
+                None
+            },
             width: node["width"].as_f64().unwrap_or(3.0) as f32,
             font_size: node["fontSize"].as_f64().unwrap_or(24.0) as f32,
             font_family: node["fontFamily"]
@@ -281,6 +395,161 @@ pub fn text_bounds(stroke: &Stroke) -> (f32, f32, f32, f32) {
     );
     let scale = stroke.scale.unwrap_or(1.0);
     (p.x, p.y, w * scale, h * scale)
+}
+
+// ============================================================================
+// Layered element hit-testing
+// ============================================================================
+
+/// Shortest Euclidean distance from point `p` to line segment `a`--`b`.
+pub fn dist_to_segment(p: Point, a: Point, b: Point) -> f32 {
+    let vx = b.x - a.x;
+    let vy = b.y - a.y;
+    let len_sq = vx * vx + vy * vy;
+    if len_sq <= 1e-6 {
+        return (p.x - a.x).hypot(p.y - a.y);
+    }
+    let t = (((p.x - a.x) * vx + (p.y - a.y) * vy) / len_sq).clamp(0.0, 1.0);
+    let proj_x = a.x + t * vx;
+    let proj_y = a.y + t * vy;
+    (p.x - proj_x).hypot(p.y - proj_y)
+}
+
+fn point_in_triangle(p: Point, a: Point, b: Point, c: Point) -> bool {
+    let sign = |p1: Point, p2: Point, p3: Point| -> f32 {
+        (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y)
+    };
+    let d1 = sign(p, a, b);
+    let d2 = sign(p, b, c);
+    let d3 = sign(p, c, a);
+    let has_neg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    let has_pos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    !(has_neg && has_pos)
+}
+
+/// Hit-test a single annotation layer at image point `p` with hit tolerance `tol` (in image px).
+///
+/// - Hollow `Rect` / `Ellipse` (without `fill_color`) only hit their border outline.
+/// - Filled `Rect` / `Ellipse` (with `fill_color`) hit anywhere inside or on the border.
+/// - `Line`, `Arrow`, and `Pen` hit their stroke path (plus arrowhead for `Arrow`).
+/// - `Text`, `Watermark`, `Number`, `Mosaic`, and `Highlighter` hit their visual area.
+pub fn hit_test_stroke(stroke: &Stroke, p: Point, tol: f32) -> bool {
+    if stroke.points.is_empty() || !stroke.tool.is_layer_editable() {
+        return false;
+    }
+    let tol = tol.max(2.0);
+    let start = stroke.points[0];
+    let end = *stroke.points.last().unwrap();
+    let min_x = start.x.min(end.x);
+    let max_x = start.x.max(end.x);
+    let min_y = start.y.min(end.y);
+    let max_y = start.y.max(end.y);
+
+    match stroke.tool {
+        Tool::Select | Tool::Eraser => false,
+        Tool::Rect => {
+            let edge_tol = (stroke.width * 0.5).max(tol);
+            if stroke.has_fill() {
+                p.x >= min_x - edge_tol
+                    && p.x <= max_x + edge_tol
+                    && p.y >= min_y - edge_tol
+                    && p.y <= max_y + edge_tol
+            } else {
+                let tl = Point { x: min_x, y: min_y };
+                let tr = Point { x: max_x, y: min_y };
+                let br = Point { x: max_x, y: max_y };
+                let bl = Point { x: min_x, y: max_y };
+                dist_to_segment(p, tl, tr) <= edge_tol
+                    || dist_to_segment(p, tr, br) <= edge_tol
+                    || dist_to_segment(p, br, bl) <= edge_tol
+                    || dist_to_segment(p, bl, tl) <= edge_tol
+            }
+        }
+        Tool::Ellipse => {
+            let cx = (min_x + max_x) * 0.5;
+            let cy = (min_y + max_y) * 0.5;
+            let rx = ((max_x - min_x) * 0.5).max(0.5);
+            let ry = ((max_y - min_y) * 0.5).max(0.5);
+            let edge_tol = (stroke.width * 0.5).max(tol);
+            let outer_x = (p.x - cx) / (rx + edge_tol);
+            let outer_y = (p.y - cy) / (ry + edge_tol);
+            if outer_x * outer_x + outer_y * outer_y > 1.0 {
+                return false;
+            }
+            if stroke.has_fill() {
+                return true;
+            }
+            if rx <= edge_tol || ry <= edge_tol {
+                return true;
+            }
+            let inner_x = (p.x - cx) / (rx - edge_tol);
+            let inner_y = (p.y - cy) / (ry - edge_tol);
+            inner_x * inner_x + inner_y * inner_y >= 1.0
+        }
+        Tool::Line => {
+            let hit_tol = (stroke.width * 0.5).max(tol);
+            dist_to_segment(p, start, end) <= hit_tol
+        }
+        Tool::Arrow => {
+            let hit_tol = (stroke.width * 0.5).max(tol);
+            if dist_to_segment(p, start, end) <= hit_tol {
+                return true;
+            }
+            let dx = end.x - start.x;
+            let dy = end.y - start.y;
+            let dist = dx.hypot(dy);
+            let head_len = dist.min((stroke.width * 4.0).max(12.0));
+            if head_len > 0.5 {
+                let angle = dy.atan2(dx);
+                let a1 = angle - std::f32::consts::PI / 6.0;
+                let a2 = angle + std::f32::consts::PI / 6.0;
+                let h1 = Point {
+                    x: end.x - head_len * a1.cos(),
+                    y: end.y - head_len * a1.sin(),
+                };
+                let h2 = Point {
+                    x: end.x - head_len * a2.cos(),
+                    y: end.y - head_len * a2.sin(),
+                };
+                let head_tol = tol * 0.75;
+                if point_in_triangle(p, end, h1, h2)
+                    || dist_to_segment(p, end, h1) <= head_tol
+                    || dist_to_segment(p, end, h2) <= head_tol
+                    || dist_to_segment(p, h1, h2) <= head_tol
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        Tool::Pen => {
+            let hit_tol = (stroke.width * 0.5).max(tol);
+            if stroke.points.len() == 1 {
+                return (p.x - start.x).hypot(p.y - start.y) <= hit_tol;
+            }
+            stroke
+                .points
+                .windows(2)
+                .any(|w| dist_to_segment(p, w[0], w[1]) <= hit_tol)
+        }
+        Tool::Text | Tool::Watermark => {
+            let (bx, by, bw, bh) = text_bounds(stroke);
+            let rel = Point {
+                x: p.x - bx,
+                y: p.y - by,
+            };
+            let unrot = rotate_point(rel, -stroke.rotation.unwrap_or(0.0));
+            unrot.x >= -tol && unrot.y >= -tol && unrot.x <= bw + tol && unrot.y <= bh + tol
+        }
+        Tool::Number => {
+            let radius = (stroke.width * 4.0).max(14.0);
+            (p.x - start.x).hypot(p.y - start.y) <= radius + tol * 0.5
+        }
+        Tool::Mosaic | Tool::Highlighter => {
+            let pad = tol * 0.5;
+            p.x >= min_x - pad && p.x <= max_x + pad && p.y >= min_y - pad && p.y <= max_y + pad
+        }
+    }
 }
 
 // ============================================================================
@@ -470,12 +739,40 @@ pub fn rasterize_annotations(base: &Rgba, strokes: &[Stroke]) -> Rgba {
             Tool::Rect => {
                 if let Some(rect) = Rect::from_xywh(x, y, rw.max(0.5), rh.max(0.5)) {
                     let path = PathBuilder::from_rect(rect);
+                    if let Some(fill_hex) = stroke.fill_color.as_deref().filter(|c| !c.is_empty()) {
+                        let (fr, fg, fb) = parse_hex_rgb(fill_hex);
+                        let mut fill_paint = Paint::default();
+                        fill_paint.set_color(Color::from_rgba8(fr, fg, fb, alpha_u8));
+                        fill_paint.anti_alias = true;
+                        layer.fill_path(
+                            &path,
+                            &fill_paint,
+                            FillRule::Winding,
+                            Transform::identity(),
+                            None,
+                        );
+                    }
                     layer.stroke_path(&path, &paint, &skia_stroke, Transform::identity(), None);
                 }
             }
             Tool::Ellipse => {
                 if let Some(rect) = Rect::from_xywh(x, y, rw.max(0.5), rh.max(0.5)) {
                     if let Some(path) = PathBuilder::from_oval(rect) {
+                        if let Some(fill_hex) =
+                            stroke.fill_color.as_deref().filter(|c| !c.is_empty())
+                        {
+                            let (fr, fg, fb) = parse_hex_rgb(fill_hex);
+                            let mut fill_paint = Paint::default();
+                            fill_paint.set_color(Color::from_rgba8(fr, fg, fb, alpha_u8));
+                            fill_paint.anti_alias = true;
+                            layer.fill_path(
+                                &path,
+                                &fill_paint,
+                                FillRule::Winding,
+                                Transform::identity(),
+                                None,
+                            );
+                        }
                         layer.stroke_path(
                             &path,
                             &paint,
@@ -811,6 +1108,14 @@ pub fn validate_annotations(input: &Value, size: (u32, u32)) -> Result<Vec<Value
         result_stroke.insert("tool".into(), json!(tool));
         result_stroke.insert("points".into(), Value::Array(normalized_points));
         result_stroke.insert("color".into(), map["color"].clone());
+        if let Some(fill_color) = map.get("fillColor") {
+            if !fill_color.is_null() {
+                if !hex_color(fill_color) {
+                    return Err(i18n::t("Invalid annotation format").into());
+                }
+                result_stroke.insert("fillColor".into(), fill_color.clone());
+            }
+        }
         result_stroke.insert("width".into(), map["width"].clone());
         if tool == "text" || tool == "watermark" {
             let text = map.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -956,6 +1261,7 @@ mod tests {
             tool: Tool::Rect,
             points: vec![Point { x: 10.0, y: 10.0 }, Point { x: 30.0, y: 30.0 }],
             color: "#ff0000".into(),
+            fill_color: None,
             width: 4.0,
             text: None,
             number: None,
@@ -975,6 +1281,7 @@ mod tests {
             tool: Tool::Eraser,
             points: vec![Point { x: 10.0, y: 10.0 }, Point { x: 30.0, y: 10.0 }],
             color: "#ff0000".into(),
+            fill_color: None,
             width: 3.0,
             text: None,
             number: None,
@@ -1000,6 +1307,7 @@ mod tests {
             tool: Tool::Highlighter,
             points: vec![Point { x: 10.0, y: 10.0 }, Point { x: 30.0, y: 30.0 }],
             color: "#f6ca45".into(),
+            fill_color: None,
             width: 3.0,
             text: None,
             number: None,
@@ -1014,5 +1322,145 @@ mod tests {
         let outside = (2 * 40 + 2) * 4;
         assert_eq!(out.pixels[inside], 240);
         assert!(out.pixels[outside] < 180);
+    }
+
+    #[test]
+    fn rasterizer_draws_filled_rect_and_ellipse() {
+        let base = Rgba::new(60, 60, vec![0u8; 60 * 60 * 4]);
+        let rect = Stroke {
+            id: "r1".into(),
+            tool: Tool::Rect,
+            points: vec![Point { x: 10.0, y: 10.0 }, Point { x: 50.0, y: 50.0 }],
+            color: "#ff0000".into(),
+            fill_color: Some("#00ff00".into()),
+            width: 4.0,
+            text: None,
+            number: None,
+            font_size: None,
+            font_family: None,
+            opacity: Some(100.0),
+            scale: None,
+            rotation: None,
+        };
+        let out = rasterize_annotations(&base, &[rect]);
+        let center = (30 * 60 + 30) * 4;
+        assert!(out.pixels[center + 1] > 200);
+        assert_eq!(out.pixels[center], 0);
+        let edge = (10 * 60 + 30) * 4;
+        assert!(out.pixels[edge] > 200);
+
+        let ellipse = Stroke {
+            id: "e1".into(),
+            tool: Tool::Ellipse,
+            points: vec![Point { x: 10.0, y: 10.0 }, Point { x: 50.0, y: 50.0 }],
+            color: "#0000ff".into(),
+            fill_color: Some("#00ff00".into()),
+            width: 4.0,
+            text: None,
+            number: None,
+            font_size: None,
+            font_family: None,
+            opacity: Some(100.0),
+            scale: None,
+            rotation: None,
+        };
+        let out_e = rasterize_annotations(&base, &[ellipse]);
+        assert!(out_e.pixels[center + 1] > 200);
+        let corner = (11 * 60 + 11) * 4;
+        assert_eq!(out_e.pixels[corner + 3], 0);
+    }
+
+    #[test]
+    fn hit_test_distinguishes_hollow_border_vs_filled_area() {
+        let make_shape = |tool: Tool, fill: Option<&str>| Stroke {
+            id: "s".into(),
+            tool,
+            points: vec![Point { x: 100.0, y: 100.0 }, Point { x: 200.0, y: 200.0 }],
+            color: "#ef6656".into(),
+            fill_color: fill.map(str::to_string),
+            width: 3.0,
+            text: None,
+            number: None,
+            font_size: None,
+            font_family: None,
+            opacity: Some(100.0),
+            scale: None,
+            rotation: None,
+        };
+
+        // Hollow rectangle: border hits, interior misses.
+        let hollow_rect = make_shape(Tool::Rect, None);
+        assert!(hit_test_stroke(&hollow_rect, Point { x: 150.0, y: 100.0 }, 6.0));
+        assert!(hit_test_stroke(&hollow_rect, Point { x: 100.0, y: 150.0 }, 6.0));
+        assert!(!hit_test_stroke(&hollow_rect, Point { x: 150.0, y: 150.0 }, 6.0));
+        assert!(!hit_test_stroke(&hollow_rect, Point { x: 50.0, y: 50.0 }, 6.0));
+
+        // Filled rectangle: interior AND border hit.
+        let filled_rect = make_shape(Tool::Rect, Some("#f6ca45"));
+        assert!(hit_test_stroke(&filled_rect, Point { x: 150.0, y: 150.0 }, 6.0));
+        assert!(hit_test_stroke(&filled_rect, Point { x: 100.0, y: 150.0 }, 6.0));
+        assert!(!hit_test_stroke(&filled_rect, Point { x: 50.0, y: 50.0 }, 6.0));
+
+        // Hollow ellipse: perimeter hits, center misses, outside corner misses.
+        let hollow_ellipse = make_shape(Tool::Ellipse, None);
+        assert!(hit_test_stroke(&hollow_ellipse, Point { x: 150.0, y: 100.0 }, 6.0));
+        assert!(!hit_test_stroke(&hollow_ellipse, Point { x: 150.0, y: 150.0 }, 6.0));
+        assert!(!hit_test_stroke(&hollow_ellipse, Point { x: 102.0, y: 102.0 }, 6.0));
+
+        // Filled ellipse: center hits, outside bounding-box corner still misses.
+        let filled_ellipse = make_shape(Tool::Ellipse, Some("#2789e8"));
+        assert!(hit_test_stroke(&filled_ellipse, Point { x: 150.0, y: 150.0 }, 6.0));
+        assert!(hit_test_stroke(&filled_ellipse, Point { x: 150.0, y: 100.0 }, 6.0));
+        assert!(!hit_test_stroke(&filled_ellipse, Point { x: 102.0, y: 102.0 }, 4.0));
+    }
+
+    #[test]
+    fn hit_test_arrow_mosaic_and_validation_of_fill_color() {
+        let arrow = Stroke {
+            id: "a1".into(),
+            tool: Tool::Arrow,
+            points: vec![Point { x: 10.0, y: 10.0 }, Point { x: 110.0, y: 10.0 }],
+            color: "#ef6656".into(),
+            fill_color: None,
+            width: 3.0,
+            text: None,
+            number: None,
+            font_size: None,
+            font_family: None,
+            opacity: Some(100.0),
+            scale: None,
+            rotation: None,
+        };
+        assert!(hit_test_stroke(&arrow, Point { x: 60.0, y: 12.0 }, 6.0));
+        assert!(!hit_test_stroke(&arrow, Point { x: 60.0, y: 40.0 }, 6.0));
+
+        let mosaic = Stroke {
+            id: "m1".into(),
+            tool: Tool::Mosaic,
+            points: vec![Point { x: 20.0, y: 20.0 }, Point { x: 80.0, y: 80.0 }],
+            color: "#ef6656".into(),
+            fill_color: None,
+            width: 4.0,
+            text: None,
+            number: None,
+            font_size: None,
+            font_family: None,
+            opacity: Some(100.0),
+            scale: None,
+            rotation: None,
+        };
+        assert!(hit_test_stroke(&mosaic, Point { x: 50.0, y: 50.0 }, 6.0));
+        assert!(!hit_test_stroke(&mosaic, Point { x: 5.0, y: 5.0 }, 6.0));
+
+        assert!(validate_annotations(
+            &serde_json::json!([stroke_json("rect", serde_json::json!({ "fillColor": "#00aa66" }))]),
+            (100, 100)
+        )
+        .is_ok());
+        assert!(validate_annotations(
+            &serde_json::json!([stroke_json("rect", serde_json::json!({ "fillColor": "invalid" }))]),
+            (100, 100)
+        )
+        .is_err());
     }
 }

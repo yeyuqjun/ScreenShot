@@ -101,7 +101,7 @@ pub fn normalize(input: Option<&Value>) -> Value {
         .get("general")
         .and_then(|g| g.get("language"))
         .and_then(|v| v.as_str())
-        .unwrap_or("en");
+        .unwrap_or("system");
     let normalized_lang = i18n::AppLanguage::from_setting(language).as_key();
     set_number(&mut s, "general.language", json!(normalized_lang));
 
@@ -131,7 +131,19 @@ pub fn normalize(input: Option<&Value>) -> Value {
         set_number(&mut s, "general.textColor", json!("auto"));
     }
 
+    let font_family = s
+        .get("general")
+        .and_then(|g| g.get("fontFamily"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(128)
+        .collect::<String>();
+    set_number(&mut s, "general.fontFamily", json!(font_family));
+
     let pairs = [
+        ("general.fontSize", 10, 22),
         ("capture.delay", 0, 10),
         ("capture.historyLimit", 5, 500),
         ("pin.opacity", 20, 100),
@@ -165,6 +177,14 @@ pub fn normalize(input: Option<&Value>) -> Value {
             let color = options.get("color").cloned();
             if !valid_hex_color(color.as_ref().unwrap_or(&Value::Null)) {
                 options.insert("color".into(), default_tool["color"].clone());
+            }
+            if default_tool.get("fillColor").is_some() {
+                let valid_fill = options
+                    .get("fillColor")
+                    .is_some_and(|v| v.is_null() || valid_hex_color(v));
+                if !valid_fill {
+                    options.insert("fillColor".into(), Value::Null);
+                }
             }
             for (name, min, max) in [("width", 1, 24), ("fontSize", 12, 96), ("opacity", 5, 100)] {
                 let clamped = clamp(options.get(name), min, max);
@@ -246,6 +266,10 @@ pub fn portable(settings: &Value) -> Value {
     general.insert("theme".into(), n["general"]["theme"].clone());
     general.insert("accent".into(), n["general"]["accent"].clone());
     general.insert("textColor".into(), n["general"]["textColor"].clone());
+    general.insert("fontFamily".into(), n["general"]["fontFamily"].clone());
+    general.insert("fontSize".into(), n["general"]["fontSize"].clone());
+    general.insert("fontBold".into(), n["general"]["fontBold"].clone());
+    general.insert("fontItalic".into(), n["general"]["fontItalic"].clone());
     general.insert("closeToTray".into(), n["general"]["closeToTray"].clone());
     out.insert("general".into(), Value::Object(general));
     for key in [
@@ -311,8 +335,12 @@ mod tests {
     fn empty_input_yields_defaults() {
         let s = normalize(None);
         assert_eq!(s, *defaults());
-        assert_eq!(s["general"]["language"], json!("en"));
+        assert_eq!(s["general"]["language"], json!("system"));
         assert_eq!(s["general"]["theme"], json!("light"));
+        assert_eq!(s["general"]["fontFamily"], json!(""));
+        assert_eq!(s["general"]["fontSize"], json!(13));
+        assert_eq!(s["general"]["fontBold"], json!(false));
+        assert_eq!(s["general"]["fontItalic"], json!(false));
     }
 
     #[test]
@@ -405,11 +433,15 @@ mod tests {
     }
 
     #[test]
-    fn language_setting_is_validated_and_defaults_to_en() {
-        assert_eq!(normalize(None)["general"]["language"], json!("en"));
+    fn language_setting_is_validated_and_defaults_to_system() {
+        assert_eq!(normalize(None)["general"]["language"], json!("system"));
         assert_eq!(
             normalize(Some(&json!({ "general": { "language": "system" } })))["general"]["language"],
             json!("system")
+        );
+        assert_eq!(
+            normalize(Some(&json!({ "general": { "language": "en" } })))["general"]["language"],
+            json!("en")
         );
         assert_eq!(
             normalize(Some(&json!({ "general": { "language": "zh-CN" } })))["general"]["language"],
@@ -421,8 +453,35 @@ mod tests {
         );
         assert_eq!(
             normalize(Some(&json!({ "general": { "language": "invalid" } })))["general"]["language"],
-            json!("en")
+            json!("system")
         );
+    }
+
+    #[test]
+    fn font_settings_are_normalized_and_preserved_in_portable() {
+        let s = normalize(Some(&json!({
+            "general": {
+                "fontFamily": "  Microsoft YaHei  ",
+                "fontSize": 99,
+                "fontBold": true,
+                "fontItalic": true
+            }
+        })));
+        assert_eq!(s["general"]["fontFamily"], json!("Microsoft YaHei"));
+        assert_eq!(s["general"]["fontSize"], json!(22));
+        assert_eq!(s["general"]["fontBold"], json!(true));
+        assert_eq!(s["general"]["fontItalic"], json!(true));
+
+        let low = normalize(Some(&json!({
+            "general": { "fontSize": 3 }
+        })));
+        assert_eq!(low["general"]["fontSize"], json!(10));
+
+        let port = portable(&s);
+        assert_eq!(port["general"]["fontFamily"], json!("Microsoft YaHei"));
+        assert_eq!(port["general"]["fontSize"], json!(22));
+        assert_eq!(port["general"]["fontBold"], json!(true));
+        assert_eq!(port["general"]["fontItalic"], json!(true));
     }
 
     #[test]

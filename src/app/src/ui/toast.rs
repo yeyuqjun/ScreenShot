@@ -75,16 +75,37 @@ fn toast_body(ui: &mut egui::Ui, toast: &Toast) -> bool {
     dismiss
 }
 
+/// Measure desired logical size for an in-window toast clamped to `max_width`.
+fn measure_in_window_size(ctx: &egui::Context, toast: &Toast, max_width: f32) -> Vec2 {
+    let spacing_x = ctx.style().spacing.item_spacing.x;
+    let text_max_w = (max_width - 28.0 - 15.0 - spacing_x).max(80.0);
+    let font = egui::TextStyle::Body.resolve(&ctx.style());
+    let galley = ctx.fonts(|f| f.layout(toast.message.clone(), font, Color32::WHITE, text_max_w));
+    let box_w = (galley.size().x + 15.0 + spacing_x + 28.0 + 4.0)
+        .min(max_width)
+        .ceil();
+    let box_h = (galley.size().y.max(18.0) + 18.0 + 4.0).ceil();
+    Vec2::new(box_w, box_h)
+}
+
 /// Draw a bottom-right toast inside an existing window (click to dismiss).
 pub fn show_in_window(ctx: &egui::Context, toast: &mut Option<Toast>, bottom_offset: f32) {
     tick(ctx, toast);
     let Some(t) = toast.as_ref() else { return };
+    let screen = ctx.screen_rect();
+    let max_w = TOAST_WIDTH.min((screen.width() - 32.0).max(160.0));
+    let desired = measure_in_window_size(ctx, t, max_w);
+    let pos = egui::pos2(
+        (screen.right() - 16.0 - desired.x).max(screen.left() + 16.0),
+        (screen.bottom() - bottom_offset - desired.y).max(screen.top() + 16.0),
+    );
     let mut dismiss = false;
     egui::Area::new(egui::Id::new("snapdock_toast"))
-        .anchor(egui::Align2::RIGHT_BOTTOM, Vec2::new(-16.0, -bottom_offset))
+        .fixed_pos(pos)
+        .constrain(true)
         .order(egui::Order::Tooltip)
         .show(ctx, |ui| {
-            ui.set_max_width(TOAST_WIDTH);
+            ui.set_max_width(desired.x);
             egui::Frame::NONE
                 .fill(t.background(ctx))
                 .corner_radius(CornerRadius::same(8))
@@ -211,5 +232,39 @@ mod tests {
         assert!(!out.shapes.is_empty());
         assert_eq!(measured.x, TOAST_WIDTH);
         assert!(measured.y >= 44.0);
+    }
+
+    #[test]
+    fn show_in_window_stays_within_bounds_after_short_to_long_transition() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(780.0, 560.0));
+        let input = || egui::RawInput {
+            screen_rect: Some(screen),
+            ..Default::default()
+        };
+
+        // Frame 1: short toast ("Settings saved")
+        let mut toast = Some(Toast::new("Settings saved", false));
+        let _ = ctx.run(input(), |ctx| {
+            show_in_window(ctx, &mut toast, 16.0);
+        });
+
+        // Frame 2: immediately switch to a long multi-line provider test success toast.
+        toast = Some(Toast::new(
+            "Provider test succeeded: SnapDock Local OCR Test\nHello RapidOCR 2026 with a much longer preview line that wraps",
+            false,
+        ));
+        let out = ctx.run(input(), |ctx| {
+            show_in_window(ctx, &mut toast, 16.0);
+        });
+        assert!(!out.shapes.is_empty());
+
+        let rect = ctx
+            .memory(|m| m.area_rect(egui::Id::new("snapdock_toast")))
+            .expect("toast area rect should be recorded");
+        assert!(rect.left() >= screen.left() + 15.0, "left={}", rect.left());
+        assert!(rect.top() >= screen.top() + 15.0, "top={}", rect.top());
+        assert!(rect.right() <= screen.right() - 14.0, "right={}", rect.right());
+        assert!(rect.bottom() <= screen.bottom() - 14.0, "bottom={}", rect.bottom());
     }
 }

@@ -25,6 +25,7 @@ pub enum Icon {
     Mosaic,
     Highlighter,
     Eraser,
+    Layers,
     Undo,
     // Capture & actions
     RecordGif,
@@ -53,10 +54,15 @@ pub enum Icon {
     Eye,
     EyeOff,
     TextPanel,
-    // Settings sections
+    // Settings sections & account actions
     SettingsGeneral,
     Keyboard,
     Cloud,
+    Swap,
+    Shield,
+    LogIn,
+    LogOut,
+    UserPlus,
 }
 
 /// Paint a centered vector icon inside `rect`.
@@ -201,6 +207,15 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             );
             painter.line_segment([p(9.2, 9.3), p(15.0, 15.1)], thin);
             painter.line_segment([p(11.3, 18.8), p(20.0, 18.8)], stroke);
+        }
+        Icon::Layers => {
+            poly(
+                &[(12.0, 4.0), (20.0, 8.2), (12.0, 12.4), (4.0, 8.2)],
+                true,
+                thin,
+            );
+            poly(&[(4.0, 12.2), (12.0, 16.4), (20.0, 12.2)], false, thin);
+            poly(&[(4.0, 16.0), (12.0, 20.2), (20.0, 16.0)], false, thin);
         }
         Icon::Undo => {
             poly(&[(9.2, 13.0), (4.5, 8.5), (9.2, 4.0)], false, stroke);
@@ -476,6 +491,56 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 thin,
             );
         }
+        Icon::Swap => {
+            painter.line_segment([p(4.5, 8.2), p(19.5, 8.2)], stroke);
+            poly(&[(15.8, 4.8), (19.5, 8.2), (15.8, 11.6)], false, stroke);
+            painter.line_segment([p(19.5, 15.8), p(4.5, 15.8)], stroke);
+            poly(&[(8.2, 12.4), (4.5, 15.8), (8.2, 19.2)], false, stroke);
+        }
+        Icon::Shield => {
+            poly(
+                &[
+                    (12.0, 3.8),
+                    (19.2, 6.8),
+                    (19.2, 12.2),
+                    (16.5, 17.2),
+                    (12.0, 20.2),
+                    (7.5, 17.2),
+                    (4.8, 12.2),
+                    (4.8, 6.8),
+                ],
+                true,
+                thin,
+            );
+            poly(&[(9.0, 12.2), (11.2, 14.4), (15.4, 9.8)], false, thin);
+        }
+        Icon::LogIn => {
+            poly(&[(13.5, 4.5), (19.2, 4.5), (19.2, 19.5), (13.5, 19.5)], false, stroke);
+            painter.line_segment([p(4.5, 12.0), p(14.5, 12.0)], stroke);
+            poly(&[(10.8, 8.3), (14.5, 12.0), (10.8, 15.7)], false, stroke);
+        }
+        Icon::LogOut => {
+            poly(&[(10.5, 4.5), (4.8, 4.5), (4.8, 19.5), (10.5, 19.5)], false, stroke);
+            painter.line_segment([p(9.5, 12.0), p(19.5, 12.0)], stroke);
+            poly(&[(15.8, 8.3), (19.5, 12.0), (15.8, 15.7)], false, stroke);
+        }
+        Icon::UserPlus => {
+            painter.circle_stroke(p(9.5, 8.0), s(3.2), thin);
+            poly(
+                &[
+                    (3.8, 19.2),
+                    (4.6, 15.6),
+                    (7.2, 14.0),
+                    (11.8, 14.0),
+                    (14.4, 15.6),
+                    (15.2, 19.2),
+                ],
+                false,
+                thin,
+            );
+            painter.line_segment([p(16.0, 11.0), p(21.0, 11.0)], thin);
+            painter.line_segment([p(18.5, 8.5), p(18.5, 13.5)], thin);
+        }
     }
 }
 
@@ -684,11 +749,13 @@ pub fn icon_nav_button(
 }
 
 /// Compact icon button for dark floating bars (pin hover bar, recorder bar).
+#[allow(dead_code)]
 pub fn dark_icon_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
     dark_icon_button_active(ui, icon, tip, false)
 }
 
 /// Compact icon button for dark floating bars with optional active accent highlight.
+#[allow(dead_code)]
 pub fn dark_icon_button_active(ui: &mut Ui, icon: Icon, tip: &str, active: bool) -> Response {
     let size = Vec2::splat(26.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
@@ -761,16 +828,74 @@ pub fn dark_icon_text_button(
 
 /// Small icon-only button (panel close buttons, folder pickers).
 pub fn small_icon_button(ui: &mut Ui, icon: Icon) -> Response {
-    let size = Vec2::splat(24.0);
+    icon_button_sized(ui, icon, Vec2::splat(24.0), 13.5, false, false)
+}
+
+/// Custom-sized icon-only button (e.g. 28x28 swap button aligned with language pickers).
+pub fn icon_button_sized(
+    ui: &mut Ui,
+    icon: Icon,
+    size: Vec2,
+    icon_size: f32,
+    active: bool,
+    primary: bool,
+) -> Response {
     let enabled = ui.is_enabled();
     let sense = if enabled { Sense::click() } else { Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     if ui.is_rect_visible(rect) {
-        let (fill, stroke, fg) = button_colors(ui, resp.hovered(), false, false, enabled, false);
+        let (fill, stroke, fg) = button_colors(ui, resp.hovered(), active, primary, enabled, false);
+        let radius = if size.y >= 28.0 { 7 } else { 5 };
         ui.painter()
-            .rect(rect, CornerRadius::same(5), fill, stroke, egui::StrokeKind::Inside);
-        let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(13.5));
+            .rect(rect, CornerRadius::same(radius), fill, stroke, egui::StrokeKind::Inside);
+        let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(icon_size));
         paint(ui.painter(), icon_rect, icon, fg);
+    }
+    resp
+}
+
+/// Compact button with icon and label (for inline status banners, list row actions, and narrow tabs).
+pub fn small_icon_text_button(
+    ui: &mut Ui,
+    icon: Icon,
+    label: &str,
+    active: bool,
+    primary: bool,
+) -> Response {
+    let enabled = ui.is_enabled();
+    let font_id = egui::TextStyle::Button.resolve(ui.style());
+    let icon_size = 13.0_f32;
+    let gap = 4.0_f32;
+    let pad_x = 7.0_f32;
+    let pad_y = 3.0_f32;
+
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font_id, Color32::WHITE);
+    let total_w = pad_x * 2.0
+        + icon_size
+        + if label.is_empty() { 0.0 } else { gap + galley.size().x };
+    let total_h = (galley.size().y.max(icon_size) + pad_y * 2.0).max(22.0);
+
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, total_h), sense);
+    if ui.is_rect_visible(rect) {
+        let (fill, stroke, fg) = button_colors(ui, resp.hovered(), active, primary, enabled, false);
+        ui.painter()
+            .rect(rect, CornerRadius::same(6), fill, stroke, egui::StrokeKind::Inside);
+
+        let x = rect.min.x + pad_x;
+        let icon_rect = Rect::from_center_size(
+            Pos2::new(x + icon_size * 0.5, rect.center().y),
+            Vec2::splat(icon_size),
+        );
+        paint(ui.painter(), icon_rect, icon, fg);
+
+        if !label.is_empty() {
+            let text_pos = Pos2::new(x + icon_size + gap, rect.center().y - galley.size().y * 0.5);
+            ui.painter()
+                .galley_with_override_text_color(text_pos, galley, fg);
+        }
     }
     resp
 }
@@ -801,6 +926,7 @@ mod tests {
         Icon::Mosaic,
         Icon::Highlighter,
         Icon::Eraser,
+        Icon::Layers,
         Icon::Undo,
         Icon::RecordGif,
         Icon::LongCapture,
@@ -831,6 +957,11 @@ mod tests {
         Icon::SettingsGeneral,
         Icon::Keyboard,
         Icon::Cloud,
+        Icon::Swap,
+        Icon::Shield,
+        Icon::LogIn,
+        Icon::LogOut,
+        Icon::UserPlus,
     ];
 
     #[test]
@@ -900,7 +1031,16 @@ mod tests {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         ui.add_enabled_ui(false, |ui| {
                             let _ = icon_text_button(ui, Icon::Save, "Save", false, false, None);
+                            let _ = small_icon_text_button(ui, Icon::Check, "Use", false, false);
                             let _ = icon_button(ui, Icon::Undo, false, false, true);
+                            let _ = icon_button_sized(
+                                ui,
+                                Icon::Swap,
+                                Vec2::splat(28.0),
+                                15.0,
+                                false,
+                                false,
+                            );
                             let _ = small_icon_button(ui, Icon::Close);
                             if dark {
                                 let _ = dark_icon_text_button(

@@ -71,4 +71,4 @@
 - AI：兼容 Chat Completions 的完整地址，发送 `{model,messages,stream:false}`；OCR 使用图像消息，翻译使用文本消息。
 - API Key 放入 `Authorization: Bearer ...`，无鉴权本机接口可留空。
 
-不内置第三方账号、模型、密钥或离线 OCR。其他厂商协议可通过自行部署的适配接口转换。
+本地 OCR 和翻译共用 ONNX Runtime，用户在设置中按需下载模型。其他厂商协议可通过自行部署的适配接口转换。
